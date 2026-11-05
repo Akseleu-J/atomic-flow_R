@@ -20,6 +20,8 @@ pub enum EvidenceError {
     Json(#[from] serde_json::Error),
     #[error("requirement checker unavailable: {0}")]
     CheckerUnavailable(String),
+    #[error("requirement checker outcome is unresolved; reconcile before continuing")]
+    CheckerOutcomeUnknown,
 }
 type Result<T> = std::result::Result<T, EvidenceError>;
 fn require(ok: bool, why: &'static str) -> Result<()> {
@@ -489,6 +491,11 @@ pub struct CheckExecution {
 /// freshness after execution. A callback/host implementation is a trust boundary,
 /// not a sandbox or cryptographic attestation of an honest host.
 pub trait HostRequirementChecker {
+    /// The host-approved number of checks in the configured inventory.
+    fn expected_checks(&self) -> u64 {
+        1
+    }
+
     fn execute(&mut self, scope: &RequirementScope) -> Result<CheckExecution>;
 }
 /// Explicit refusal adapter for environments without independent check execution.

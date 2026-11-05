@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parents[2]
-paths = subprocess.check_output(["git", "ls-files", "-z", "--", "rust", "ts/af-client", 
+paths = subprocess.check_output(["git", "ls-files", "-z", "--", "rust", "ts/af-client", "ts/af-studio", "validation/studio-reviewed-20261105/smoke.py", 
     "docs/PRODUCTION_STATUS_2026-11-04.json", "validation/production-20261104/check_registry.py",
     "validation/production-20261104/capture_source.py", "validation/production-ci-20261105", "validation/production-20261104/sdk-native-consumer.mjs", ".github/workflows/studio.yml", ".github/workflows/rust.yml", ".github/workflows/surfaces.yml",
     "validation/zcode-studio-20261104/http_smoke.py", "validation/zcode-studio-20261104/ui-tests.mjs"], cwd=root).decode("utf-8").split("\0")

@@ -35,6 +35,12 @@ enum Command {
         /// Read the server token from this process environment variable.
         #[arg(long, conflicts_with = "token")]
         token_env: Option<String>,
+        /// Serve a built React Studio bundle at /studio/.
+        #[arg(long)]
+        studio_dist: Option<PathBuf>,
+        /// Enable one exact source replacement from a trusted host review profile.
+        #[arg(long)]
+        reviewed_edit_profile: Option<PathBuf>,
     },
     /// MCP stdio server: line-delimited JSON-RPC over stdin/stdout.
     Mcp,
@@ -70,8 +76,40 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Native task vertical (N06): durable admission queue → guided edit
+    /// journey → host requirement gate → queue resolution.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// In-process vertical journey: build → delta → parity on a scratch root.
     SelfTest,
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// Run one native task through the durable queue and the requirement gate.
+    Run {
+        #[arg(long)]
+        root_id: String,
+        #[arg(long)]
+        file: String,
+        /// Exact reviewed replacement text (the reviewed plan; never model output).
+        #[arg(long)]
+        replacement: String,
+        #[arg(long, default_value = "native task journey")]
+        goal: String,
+        /// Model backend: provider id registered in trusted host config, or
+        /// omitted for the scripted local backend.
+        #[arg(long)]
+        provider_id: Option<String>,
+        #[arg(long, default_value = "scripted://local")]
+        base_url: String,
+        #[arg(long, default_value = "")]
+        api_key_env: String,
+        #[arg(long, default_value = "kernel-scripted")]
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -260,6 +298,8 @@ fn main() {
         bind,
         token,
         token_env,
+        studio_dist,
+        reviewed_edit_profile,
     } = cli.command
     {
         let token = match token_env {
@@ -283,7 +323,12 @@ fn main() {
             .build()
             .map_err(|error| format!("tokio runtime failed: {error}"));
         let result = match runtime {
-            Ok(runtime) => runtime.block_on(server::run(&bind, token)),
+            Ok(runtime) => runtime.block_on(server::run(
+                &bind,
+                token,
+                studio_dist,
+                reviewed_edit_profile,
+            )),
             Err(error) => Err(error),
         };
         match result {
@@ -339,6 +384,27 @@ fn run(command: Command) -> Result<String, String> {
                 goal,
                 session_id,
             } => agent_journey(root_id, file, replacement, goal, session_id),
+        },
+        Command::Task { command } => match command {
+            TaskCommand::Run {
+                root_id,
+                file,
+                replacement,
+                goal,
+                provider_id,
+                base_url,
+                api_key_env,
+                model,
+            } => task_run(
+                root_id,
+                file,
+                replacement,
+                goal,
+                provider_id,
+                base_url,
+                api_key_env,
+                model,
+            ),
         },
         Command::Graph { command } => match command {
             GraphCommand::Build { root, store } => graph_build(root, store),
@@ -632,6 +698,167 @@ fn agent_journey(
         "session_id": journal.session_id,
     });
     if report.ok {
+        Ok(serde_json::to_string(&value).map_err(|e| e.to_string())?)
+    } else {
+        Err(serde_json::to_string(&value).map_err(|e| e.to_string())?)
+    }
+}
+
+/// Native task vertical (N06): the durable admission queue admits the task,
+/// the guided edit journey executes it, and the host requirement gate decides
+/// the outcome. Without an admitted behavioral checker the gate refuses by
+/// contract, so the task ends Unverified and the queue records exactly that.
+#[allow(clippy::too_many_arguments)]
+fn task_run(
+    root_id: String,
+    file: String,
+    replacement: String,
+    goal: String,
+    provider_id: Option<String>,
+    base_url: String,
+    api_key_env: String,
+    model: String,
+) -> Result<String, String> {
+    let registry = af_sandbox::SandboxRegistry::new("default").map_err(|e| e.0)?;
+    let backend = crate::trusted_provider::select(
+        provider_id.as_deref(),
+        &base_url,
+        &api_key_env,
+        &model,
+        None,
+    )?;
+    let router = af_llm::Router::new(vec![backend]);
+
+    // Durable admission: idempotency key binds the exact reviewed plan, so a
+    // resubmission of the same task never forks a second entry.
+    let payload_digest = af_sandbox::sha256_hex(replacement.as_bytes());
+    let entry_id = format!(
+        "task-{}",
+        af_sandbox::sha256_hex(format!("{root_id}\n{file}\n{replacement}").as_bytes(),)[..16]
+            .to_string()
+    );
+    let queue_path = af_sandbox::user_dir().join("tasks");
+    std::fs::create_dir_all(&queue_path).map_err(|e| e.to_string())?;
+    let queue_path = queue_path.join("queue.jsonl");
+    let mut queue = if queue_path.exists() {
+        af_exec::durable_queue::DurableAdmission::open(&queue_path).map_err(|e| e.0)?
+    } else {
+        af_exec::durable_queue::DurableAdmission::create(&queue_path).map_err(|e| e.0)?
+    };
+    let entry_id = format!("task-{}", &entry_id[..12]);
+    queue
+        .submit(&entry_id, "native-task", &entry_id, 0, &payload_digest)
+        .map_err(|e| e.0)?;
+    let reservation = queue.reserve(&entry_id, "af-cli").map_err(|e| e.0)?;
+    let reservation_fence = reservation.fence;
+
+    let session_id = format!("task-{}", &entry_id[5..]);
+    let project = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut journal = af_journal::SessionJournal::create(&project, Some(&session_id), None)
+        .or_else(|_| af_journal::SessionJournal::open(&session_id))
+        .map_err(|e| e.0)?;
+
+    let toolset = edit_toolset_for(&registry, &root_id)?;
+    // Host requirement gate: no behavioral checker is admitted on the CLI, so
+    // UnavailableChecker refuses — the task stays Unverified unless a host
+    // installs a real checker (trusted in-process adapter).
+    let mut checker = af_evidence::UnavailableChecker;
+    let mut requirement = af_loop::edit::EditRequirement {
+        checker: &mut checker,
+        requirement_id: "behavioral-requirement".into(),
+        requirement_contract_sha256: af_sandbox::sha256_hex(goal.as_bytes()),
+        check_inventory_sha256: af_sandbox::sha256_hex(b"host-admitted-checker-pending"),
+        workspace_id: "default".into(),
+        revision: "staged".into(),
+    };
+    let outcome = af_loop::edit::run_edit_task(
+        &router,
+        &toolset,
+        Some(&mut journal),
+        &model,
+        &goal,
+        true,
+        af_loop::LoopLimits::default(),
+        None,
+        Some(&mut requirement),
+    )?;
+
+    let (state, summary) = match &outcome {
+        af_loop::edit::EditOutcome::Completed {
+            edits, check, git, ..
+        } => {
+            queue
+                .complete(
+                    &entry_id,
+                    "af-cli",
+                    reservation_fence,
+                    &af_sandbox::sha256_hex(check.to_string().as_bytes()),
+                )
+                .map_err(|e| e.0)?;
+            (
+                "completed",
+                json!({"edits": edits, "requirement_check": check["requirement_check"], "git": git}),
+            )
+        }
+        af_loop::edit::EditOutcome::Unverified {
+            edits, check, git, ..
+        } => {
+            queue
+                .fail(
+                    &entry_id,
+                    "af-cli",
+                    reservation_fence,
+                    "unverified: no admitted behavioral checker receipt",
+                )
+                .map_err(|e| e.0)?;
+            (
+                "unverified",
+                json!({"edits": edits, "requirement_check": check["requirement_check"], "git": git}),
+            )
+        }
+        af_loop::edit::EditOutcome::CheckFailed { edits, check, .. } => {
+            queue
+                .fail(
+                    &entry_id,
+                    "af-cli",
+                    reservation_fence,
+                    "final diagnostic gate failed",
+                )
+                .map_err(|e| e.0)?;
+            ("check_failed", json!({"edits": edits, "check": check}))
+        }
+        af_loop::edit::EditOutcome::Interrupted {
+            loop_outcome,
+            edits,
+        } => {
+            queue
+                .fail(
+                    &entry_id,
+                    "af-cli",
+                    reservation_fence,
+                    "journey interrupted; effects reconciliation required",
+                )
+                .map_err(|e| e.0)?;
+            (
+                "interrupted",
+                json!({"edits": edits, "outcome": format!("{loop_outcome:?}")}),
+            )
+        }
+    };
+    let snapshot = queue.snapshot().map_err(|e| e.0)?;
+    let entry = snapshot
+        .entries
+        .get(&entry_id)
+        .map(|entry| json!({"entry_id": entry.entry_id, "state": entry.state.as_str()}))
+        .unwrap_or(Value::Null);
+    let value = json!({
+        "ok": state == "completed",
+        "state": state,
+        "entry": entry,
+        "summary": summary,
+        "session_id": journal.session_id,
+    });
+    if state == "completed" {
         Ok(serde_json::to_string(&value).map_err(|e| e.to_string())?)
     } else {
         Err(serde_json::to_string(&value).map_err(|e| e.to_string())?)

@@ -18,6 +18,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 #[path = "http_safety.rs"]
 mod http_safety;
+#[path = "reviewed_edit.rs"]
+mod reviewed_edit;
+#[path = "studio_build.rs"]
+mod studio_build;
 #[path = "studio_data.rs"]
 mod studio_data;
 
@@ -36,6 +40,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Clone)]
 struct ServerState {
     token: Option<String>,
+    studio: Option<Arc<studio_build::StudioBuild>>,
+    reviewed_edit: Option<Arc<reviewed_edit::Profile>>,
     port: u16,
     streams: Arc<tokio::sync::Semaphore>,
     edits: Arc<tokio::sync::Semaphore>,
@@ -59,13 +65,20 @@ fn authorized(state: &ServerState, headers: &HeaderMap) -> bool {
 
 #[cfg(test)]
 fn build_router(token: Option<String>) -> Router {
-    build_router_for(token, 8787)
+    build_router_for(token, 8787, None, None)
 }
 
-fn build_router_for(token: Option<String>, port: u16) -> Router {
+fn build_router_for(
+    token: Option<String>,
+    port: u16,
+    studio: Option<Arc<studio_build::StudioBuild>>,
+    reviewed_edit: Option<Arc<reviewed_edit::Profile>>,
+) -> Router {
     let token = token.filter(|value| !value.is_empty());
     let state = ServerState {
         token,
+        studio,
+        reviewed_edit,
         port,
         streams: Arc::new(tokio::sync::Semaphore::new(4)),
         edits: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -75,12 +88,18 @@ fn build_router_for(token: Option<String>, port: u16) -> Router {
         .route("/", get(root_redirect))
         .route("/health", get(health))
         .route("/dashboard", get(dashboard))
+        .route("/studio/", get(studio_build::index))
+        .route("/studio/assets/{name}", get(studio_build::asset))
         .route("/v1/doctor", get(doctor_ep))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/sessions", get(list_sessions_ep).post(create_session))
         .route("/v1/sessions/{id}/events", post(append_event))
         .route("/v1/sessions/{id}", get(read_session))
         .route("/v1/edit-journeys", post(edit_journey))
+        .route(
+            "/v1/reviewed-edit",
+            get(reviewed_edit::inspect).post(reviewed_edit::apply),
+        )
         .route("/v1/chat/stream", post(chat_stream_sse))
         .route("/v1/jobs", get(job_status))
         .route("/v1/roots", get(list_roots_ep).post(grant_root_ep))
@@ -1157,7 +1176,25 @@ pub fn bind_allowed(bind: &str, token: &Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn run(bind: &str, token: Option<String>) -> Result<(), String> {
+pub async fn run(
+    bind: &str,
+    token: Option<String>,
+    studio_dist: Option<PathBuf>,
+    reviewed_edit_profile: Option<PathBuf>,
+) -> Result<(), String> {
+    if reviewed_edit_profile.is_some() && token.as_ref().is_none_or(String::is_empty) {
+        return Err("reviewed edit profile requires server authentication".into());
+    }
+    let reviewed_edit = reviewed_edit_profile
+        .as_deref()
+        .map(reviewed_edit::Profile::load)
+        .transpose()?
+        .map(Arc::new);
+    let studio = studio_dist
+        .as_deref()
+        .map(studio_build::StudioBuild::load)
+        .transpose()?
+        .map(Arc::new);
     bind_allowed(bind, &token)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -1166,7 +1203,7 @@ pub async fn run(bind: &str, token: Option<String>) -> Result<(), String> {
         .local_addr()
         .map_err(|_| "listener identity unavailable".to_string())?
         .port();
-    let app = build_router_for(token, port);
+    let app = build_router_for(token, port, studio, reviewed_edit);
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("serve failed: {error}"))

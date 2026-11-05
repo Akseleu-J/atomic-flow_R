@@ -26,7 +26,7 @@ pub enum EntryState {
     Failed,
 }
 impl EntryState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             EntryState::Submitted => "submitted",
             EntryState::Reserved => "reserved",

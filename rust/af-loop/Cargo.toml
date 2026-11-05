@@ -6,6 +6,7 @@ license.workspace = true
 description = "Model-driven tool loop on the kernel: tool registry, bounded turns, journal evidence, hold semantics, and the guided edit loop (the Aider/Claude-Code-style harness)"
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true

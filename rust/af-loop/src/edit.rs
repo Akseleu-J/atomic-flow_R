@@ -508,7 +508,7 @@ pub fn run_edit_task(
                 "reason":"no host-bound completed requirement checker was supplied"});
             let mut receipt_ok = false;
             let mut checked_inventory = None;
-            if diagnostic_passed {
+            if diagnostic_passed || not_configured {
                 if let Some(req) = requirement {
                     let manifest = toolset
                         .requirement_inventory()
@@ -528,25 +528,38 @@ pub fn run_edit_task(
                             runtime_id: "af-loop-edit-gate".into(),
                         },
                         check_inventory_sha256: req.check_inventory_sha256.clone(),
-                        expected_checks: 1,
+                        expected_checks: req.checker.expected_checks(),
                     };
                     let requirement_effect = af_entropy::token();
                     journal.begin_effect("tool_request", &requirement_effect,
-                        &json!({"name":"host_requirement_check", "inventory_sha256":scope.binding.inventory_sha256}))
+                        &json!({"name":"host_requirement_check", "inventory_sha256":scope.binding.inventory_sha256,
+                            "check_inventory_sha256":scope.check_inventory_sha256, "expected_checks":scope.expected_checks}))
                         .map_err(|_| "requirement checkpoint failed; checker was not authorized")?;
                     let receipt = af_evidence::run_requirement_check(&scope, req.checker);
                     // A callback may execute code. Its result cannot authorize
                     // completion using an inventory captured before execution.
                     let fresh = toolset.requirement_inventory();
-                    if fresh.as_ref().ok() != Some(&manifest) {
+                    let unknown = matches!(
+                        &receipt,
+                        Err(af_evidence::EvidenceError::CheckerOutcomeUnknown)
+                    );
+                    if unknown || fresh.as_ref().ok() != Some(&manifest) {
                         *toolset.effects_unknown.borrow_mut() = true;
+                        let reason = if unknown {
+                            "requirement checker outcome is unresolved; reconcile before continuation"
+                        } else {
+                            "requirement checker changed source, root authority, or unresolved effects; reconcile before continuation"
+                        };
                         journal.finish_effect("tool_effect_unknown", &requirement_effect,
-                            &json!({"reason":"requirement checker changed source, root authority, or unresolved effects; reconcile before continuation"}), "unknown")
+                            &json!({"reason":reason}), "unknown")
                             .map_err(|_| "requirement freshness failure persistence failed; durable hold retained")?;
-                        return Ok(EditOutcome::Interrupted { edits, loop_outcome: LoopOutcome::Hold {
-                            backend: "host-check".into(),
-                            detail: "requirement checker freshness audit failed; reconcile before continuation".into(),
-                        }});
+                        return Ok(EditOutcome::Interrupted {
+                            edits,
+                            loop_outcome: LoopOutcome::Hold {
+                                backend: "host-check".into(),
+                                detail: reason.into(),
+                            },
+                        });
                     }
                     match receipt {
                         Ok(receipt) => {
