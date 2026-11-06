@@ -3,6 +3,7 @@
 //! thin; all authority checks live in the crates. Sandbox mutations require
 //! the explicit `--host-approved` flag: the human running the CLI is the host.
 
+mod behavioral_checker;
 mod dashboard;
 mod doctor;
 mod server;
@@ -109,6 +110,13 @@ enum TaskCommand {
         api_key_env: String,
         #[arg(long, default_value = "kernel-scripted")]
         model: String,
+        /// Host-admitted behavioral check: comma-separated argv whose run must
+        /// (re)produce a fully green JUnit report at --junit. Omitted means no
+        /// behavioral checker is admitted and the task ends Unverified.
+        #[arg(long)]
+        check_argv: Option<String>,
+        #[arg(long)]
+        junit: Option<PathBuf>,
     },
 }
 
@@ -395,6 +403,8 @@ fn run(command: Command) -> Result<String, String> {
                 base_url,
                 api_key_env,
                 model,
+                check_argv,
+                junit,
             } => task_run(
                 root_id,
                 file,
@@ -404,6 +414,8 @@ fn run(command: Command) -> Result<String, String> {
                 base_url,
                 api_key_env,
                 model,
+                check_argv,
+                junit,
             ),
         },
         Command::Graph { command } => match command {
@@ -718,6 +730,8 @@ fn task_run(
     base_url: String,
     api_key_env: String,
     model: String,
+    check_argv: Option<String>,
+    junit: Option<PathBuf>,
 ) -> Result<String, String> {
     let registry = af_sandbox::SandboxRegistry::new("default").map_err(|e| e.0)?;
     let backend = crate::trusted_provider::select(
@@ -759,17 +773,51 @@ fn task_run(
         .map_err(|e| e.0)?;
 
     let toolset = edit_toolset_for(&registry, &root_id)?;
-    // Host requirement gate: no behavioral checker is admitted on the CLI, so
-    // UnavailableChecker refuses — the task stays Unverified unless a host
-    // installs a real checker (trusted in-process adapter).
-    let mut checker = af_evidence::UnavailableChecker;
-    let mut requirement = af_loop::edit::EditRequirement {
-        checker: &mut checker,
-        requirement_id: "behavioral-requirement".into(),
-        requirement_contract_sha256: af_sandbox::sha256_hex(goal.as_bytes()),
-        check_inventory_sha256: af_sandbox::sha256_hex(b"host-admitted-checker-pending"),
-        workspace_id: "default".into(),
-        revision: "staged".into(),
+    // Host requirement gate. With --check-argv/--junit the admitted
+    // behavioral checker executes the real suite and its green JUnit report
+    // mints the receipt; without them UnavailableChecker refuses and the
+    // task ends Unverified by contract.
+    let root_item = registry.get(&root_id).map_err(|e| e.0)?;
+    let root_path = PathBuf::from(root_item["path"].as_str().unwrap_or_default());
+    let job_runner =
+        af_exec::JobRunner::open(&af_sandbox::user_dir().join("jobs")).map_err(|e| e.0)?;
+    let mut behavioral = check_argv
+        .as_ref()
+        .zip(junit.as_ref())
+        .map(
+            |(argv, junit_path)| behavioral_checker::CommandBehavioralChecker {
+                checker_id: "host-tests".into(),
+                runner: job_runner,
+                argv: argv
+                    .split(',')
+                    .map(|part| part.trim().to_string())
+                    .collect(),
+                cwd: root_path.clone(),
+                junit_path: junit_path.clone(),
+            },
+        );
+    let mut unavailable = af_evidence::UnavailableChecker;
+    let mut requirement = match behavioral.as_mut() {
+        Some(checker) => af_loop::edit::EditRequirement {
+            checker,
+            checker_id: "host-tests".into(),
+            requirement_id: "behavioral-requirement".into(),
+            requirement_contract_sha256: af_sandbox::sha256_hex(goal.as_bytes()),
+            check_inventory_sha256: af_sandbox::sha256_hex(
+                format!("junit:{}", junit.as_ref().unwrap().to_string_lossy()).as_bytes(),
+            ),
+            workspace_id: "default".into(),
+            revision: "staged".into(),
+        },
+        None => af_loop::edit::EditRequirement {
+            checker: &mut unavailable,
+            checker_id: "unavailable".into(),
+            requirement_id: "behavioral-requirement".into(),
+            requirement_contract_sha256: af_sandbox::sha256_hex(goal.as_bytes()),
+            check_inventory_sha256: af_sandbox::sha256_hex(b"host-admitted-checker-pending"),
+            workspace_id: "default".into(),
+            revision: "staged".into(),
+        },
     };
     let outcome = af_loop::edit::run_edit_task(
         &router,

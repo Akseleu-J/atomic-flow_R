@@ -349,6 +349,7 @@ pub enum EditOutcome {
 /// post-edit source inventory and the outcome becomes `Completed`.
 pub struct EditRequirement<'a> {
     pub checker: &'a mut dyn af_evidence::HostRequirementChecker,
+    pub checker_id: String,
     pub requirement_id: String,
     pub requirement_contract_sha256: String,
     pub check_inventory_sha256: String,
@@ -520,7 +521,7 @@ pub fn run_edit_task(
                         task_id: journal.session_id.clone(),
                         requirement_id: req.requirement_id.clone(),
                         requirement_contract_sha256: req.requirement_contract_sha256.clone(),
-                        checker_id: "host-edit-gate".into(),
+                        checker_id: req.checker_id.clone(),
                         binding: af_evidence::SourceBinding {
                             workspace_id: req.workspace_id.clone(),
                             source_revision: req.revision.clone(),
@@ -1061,6 +1062,7 @@ mod tests {
         let mut checker = EchoingChecker;
         let mut requirement = EditRequirement {
             checker: &mut checker,
+            checker_id: "host-tests".into(),
             requirement_id: "tests-pass".into(),
             requirement_contract_sha256: af_evidence::sha256(b"tests must pass"),
             check_inventory_sha256: af_evidence::sha256(b"pytest -q"),
@@ -1134,6 +1136,7 @@ mod tests {
         let mut checker = af_evidence::UnavailableChecker;
         let mut requirement = EditRequirement {
             checker: &mut checker,
+            checker_id: "host-tests".into(),
             requirement_id: "tests-pass".into(),
             requirement_contract_sha256: af_evidence::sha256(b"tests must pass"),
             check_inventory_sha256: af_evidence::sha256(b"pytest -q"),
@@ -1210,6 +1213,7 @@ mod tests {
         let mut checker = MutatingChecker(|| mutate(&temp, &registry));
         let mut requirement = EditRequirement {
             checker: &mut checker,
+            checker_id: "host-tests".into(),
             requirement_id: "tests-pass".into(),
             requirement_contract_sha256: af_evidence::sha256(b"tests must pass"),
             check_inventory_sha256: af_evidence::sha256(b"independent checks"),
@@ -1596,5 +1600,92 @@ mod tests {
         assert!(std::fs::read_to_string(temp.root.join("lib.py"))
             .unwrap()
             .contains("return 1"));
+    }
+    #[test]
+    fn failed_check_refuses_requirement_and_blocks_auto_commit() {
+        let (temp, registry) = setup();
+        // Content-dependent check: passes only when lib.py carries the v2
+        // marker. The model's single attempt does not add it, so the fresh
+        // final gate must fail honestly: no receipt, no auto-commit — the
+        // multi-changeset repair loop is the next publication slice.
+        let document: Value =
+            serde_json::from_str(&std::fs::read_to_string(temp.store.join("graph.json")).unwrap())
+                .unwrap();
+        let runner = af_exec::JobRunner::open(&temp.home.join("jobs")).unwrap();
+        #[cfg(windows)]
+        let check_argv = vec![
+            "cmd".into(),
+            "/C".into(),
+            "findstr v2 lib.py 1>nul 2>&1".into(),
+        ];
+        #[cfg(not(windows))]
+        let check_argv = vec!["sh".into(), "-c".into(), "grep v2 lib.py".into()];
+        let toolset = EditToolset::new(
+            &registry,
+            "main",
+            runner,
+            document,
+            check_argv,
+            temp.root.clone(),
+            4,
+        )
+        .unwrap()
+        .with_write_scope(&["lib.py".into()])
+        .unwrap();
+        let backend = ScriptedBackend::new(
+            "scripted",
+            vec![
+                completed(
+                    "",
+                    vec![call("c0", r#"{"op":"read_file","path":"lib.py"}"#)],
+                ),
+                completed(
+                    "",
+                    vec![call(
+                        "c1",
+                        r#"{"op":"apply_edit","path":"lib.py","replacement":"def helper():\n    return 2\n"}"#,
+                    )],
+                ),
+                completed("", vec![call("c2", r#"{"op":"run_check"}"#)]),
+                completed("it is fine", vec![]),
+            ],
+        );
+        let router = Router::new(vec![Box::new(backend)]);
+        let mut journal = edit_journal(&temp);
+        let mut checker = EchoingChecker;
+        let mut requirement = EditRequirement {
+            checker: &mut checker,
+            checker_id: "host-tests".into(),
+            requirement_id: "marker-check".into(),
+            requirement_contract_sha256: af_evidence::sha256(b"v2 marker required"),
+            check_inventory_sha256: af_evidence::sha256(b"findstr v2"),
+            workspace_id: "default".into(),
+            revision: "staged".into(),
+        };
+        let outcome = run_edit_task(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            "m",
+            "reach the v2 marker",
+            true,
+            LoopLimits::default(),
+            None,
+            Some(&mut requirement),
+        )
+        .unwrap();
+        match outcome {
+            EditOutcome::CheckFailed {
+                edits, check, git, ..
+            } => {
+                assert_eq!(edits, 1);
+                assert_eq!(check["diagnostic_passed"], json!(false));
+                assert_eq!(check["requirement_check"]["status"], json!("not_assessed"));
+                assert_eq!(git["committed"], json!(false));
+            }
+            other => panic!("expected an honest check-failed outcome, got {other:?}"),
+        }
+        let on_disk = std::fs::read_to_string(temp.root.join("lib.py")).unwrap();
+        assert!(!on_disk.contains("v2"));
     }
 }

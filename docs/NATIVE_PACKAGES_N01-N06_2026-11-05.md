@@ -39,9 +39,14 @@ auto-commit now happens ONLY on a verified receipt (failure recorded
 honestly, never flips the verdict). Wire-constructed receipts stay data and
 are refused as authorization. The safe-apply surface remains disabled
 wherever no checker is admitted.
-Remaining: an admitted independent behavioral checker (trusted host adapter)
-is still NOT installed anywhere — CLI journeys run `UnavailableChecker` and
-end `Unverified` by design.
+Implemented: `af-cli::behavioral_checker::CommandBehavioralChecker` — the first
+admitted behavioral checker adapter. It runs the host-configured argv through
+the durable job runner, requires a fully green JUnit report (zero tests,
+failures, errors or skips all refuse), pins the oracle by refusing source
+mutation during execution, and mints the receipt through
+`run_requirement_check`. `af task run --check-argv <cmd> --junit <path>` now
+can end `completed` when the real suite is green; without the flags the
+UnavailableChecker path still refuses by contract.
 
 ## N04 — Graph delta parity (P01, P02, E02)
 
