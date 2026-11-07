@@ -279,7 +279,9 @@ async fn revoke_root_ep(
 /// Open the native OS folder picker (Explorer-style IFileOpenDialog) on the
 /// host machine. The server shares the operator's interactive session, so the
 /// dialog appears on their desktop; the choice never leaves the machine.
-/// A cancelled dialog is reported as `cancelled`, not an error.
+/// A cancelled dialog is reported as `cancelled`, not an error. The picker is
+/// a Windows-host capability: headless Linux hosts refuse honestly.
+#[cfg(windows)]
 async fn pick_folder_ep(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -314,6 +316,20 @@ async fn pick_folder_ep(
         }))),
         None => Ok(Json(json!({"ok": true, "cancelled": true}))),
     }
+}
+
+#[cfg(not(windows))]
+async fn pick_folder_ep(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if auth_denied(&state, &headers).is_some() {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Err(api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "native folder picker is a Windows-host capability; specify the root path directly",
+    ))
 }
 
 /// Durable budget ledger (af-budget authority). One fixed owner/ledger per

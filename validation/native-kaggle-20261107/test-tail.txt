@@ -1,0 +1,30 @@
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_agents-1178c23aa2ab0288)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_budget-d592c44fa0aa7f85)
+     Running unittests src/main.rs (/kaggle/tmp/target/debug/deps/af-6e52078844585807)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_context-6e63874cbb4c4a88)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_entropy-4a649df715760220)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_evidence-4b71a1e04602946c)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_exec-545a555abbf8eab6)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_graph-8fc402a0ac282a0d)
+     Running tests/delta_parity.rs (/kaggle/tmp/target/debug/deps/delta_parity-7afc84fa6839a28b)
+     Running tests/python_reference.rs (/kaggle/tmp/target/debug/deps/python_reference-1820ebbb58e331fa)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_journal-1b6012167fb5ef0e)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_llm-23eab86f9521755f)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_loop-959f3bfbae71d012)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_memory-aa6803139bc19609)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_program-0f02ab674777d7ef)
+     Running unittests src/lib.rs (/kaggle/tmp/target/debug/deps/af_sandbox-0090a483c6cc2e29)
+   Doc-tests af_agent
+   Doc-tests af_agents
+   Doc-tests af_budget
+   Doc-tests af_context
+   Doc-tests af_entropy
+   Doc-tests af_evidence
+   Doc-tests af_exec
+   Doc-tests af_graph
+   Doc-tests af_journal
+   Doc-tests af_llm
+   Doc-tests af_loop
+   Doc-tests af_memory
+   Doc-tests af_program
+   Doc-tests af_sandbox
