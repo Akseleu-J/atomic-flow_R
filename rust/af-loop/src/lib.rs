@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 pub mod compact;
 pub mod edit;
+pub mod enrich;
 pub mod requirement;
 pub mod schedule;
 pub mod steer;
