@@ -61,10 +61,13 @@ Git identity для коммитов: Omirbay Akseleu (уже в конфига�
 | `docs/PRODUCTION_INCREMENT_2026-11-04.md` | E00/E01+P09/E04 инкремент (codex) |
 | `docs/POLYGLOT_RECONSTRUCTION_PLAN_2026-11-03.md` | карта переноса Rust/TS/Python, волны параллельных агентов |
 | `docs/REAL_API_BENCHMARK_PROTOCOL.md` | live-модель: чистый SHA, квоты до/после, unknown не ретраится |
+| `docs/ADR-0002-live-context-enrichment.md` | N05 дизайн: enrichment под бюджет-протоколом, решения D1–D6, слайсы S1–S3 |
+| `docs/BETA_READINESS_CHECKLIST.md` | бета 300–500/96ч: T0 инцидент, T1 first-contact, T2 механика беты, T3 очередь, T4 enterprise-гэпы |
 | `docs/ATOMIC_FLOW_PROTOCOLS_MASTER.md` | ЭТОТ документ |
 
 ## 8. Состояние (на 09.11.2026)
-- **atomic-flow_R (main=experimental=dd45897):** Rust-линия полиглот-миграции. Готово: P00–P06 слайсы, P07 инженерный пилот (Python TaskRunner, отдельная приёмка), N01–N06 инженерные пакеты (af-evidence, af-budget, durable_queue, behavioral checker, интеграционный mock-LLM тест, delta-parity, «af task run»), Studio-дашборд v2.1, 256 тестов + Kaggle Linux 354/0. Открыто: N05 (live-семантика, нужен бюджет-протокол), N07–N12 (Linux worker, installed release, corporate profile, live-грады) — внешние свидетельства.
+- **T0-инцидент (09.11, ЗАКРЫТ):** значение пароля vault побывало в публичном `r/main` через §0 этого документа; `atomic-flow_R` — PUBLIC (док ошибочно считал его private). Выполнено: скраб + force-push обеих веток (`e8b937b`), ротация пароля (менеджер владельца), чистка OneDrive-копии. Осталось за владельцем: ротация токенов (T0.2), проверка шеппинга `shared-access` (T0.5). Правило: значение пароля никогда не в коммитимых файлах/чате/логах.
+- **atomic-flow_R (main=experimental=e8b937b):** Rust-линия полиглот-миграции. Готово: P00–P06 слайсы, P07 инженерный пилот (Python TaskRunner, отдельная приёмка), N01–N06 инженерные пакеты (af-evidence, af-budget, durable_queue, behavioral checker, интеграционный mock-LLM тест, delta-parity, «af task run»), Studio-дашборд v2.1, 256 тестов + Kaggle Linux 354/0. ADR-0002 (N05) утверждён, слайс S1 в работе. Открыто: N05 S1–S3, N07–N12 (Linux worker, installed release, corporate profile, live-грады) — внешние свидетельства. Бета: 300–500 мест, 96ч/участник, self-host — план в `docs/BETA_READINESS_CHECKLIST.md`.
 - **Кодекс-сессия:** инкременты N01/N02/E04 (af-evidence, capabilities, recovery-CLI), ветка codex/studio-safe-zcode-20261104 (пушит в github-remote).
 - **Хакатон (ЗАКРЫТ 09.11):** skillradar → hackathon-kz/...-31-atomic, main=5614f18+9a2475a. AI-стажёр сдан: ментор+Rust-агент+TS-студия+рынок hh.kz, 12 тестов, deck PDF, демо-видео 3:10 (OneDrive/Desktop/ai-stazher-demo.mp4 → владелец грузит на Google Диск). Дисквалификация-граница соблюдена: код atomic-flow не сдавался.
 - **Память ассистента:** hackathon-skillradar.md (закрыт), atomic-flow-project-setup.md, ATOMIC_FLOW_PROTOCOLS.md, atomic-flow-b2b-roadmap.md.
