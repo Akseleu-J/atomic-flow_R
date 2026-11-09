@@ -58,9 +58,10 @@ tour|impact, модель, schema-версия промпта). Попадани
 
 | Слайс | Содержимое | Приёмка |
 |---|---|---|
-| S1 | Детерминированный каркас: типы EnrichmentRecord / NoAnswer / Completeness, scoped-кэш, запись в журнал и отчёт (без live-вызовов) | Юнит-тесты (дом — `af-budget/src/lib.rs`, `af-evidence/src/tests.rs`); 256+ тестов зелёные локально |
-| S2 | Live-проводка по D1–D2: enrichment через `AccountedBackend`; семантика hold/refusal/unknown | Тесты на ScriptedBackend-обёртке (шаблон — тесты `trusted_provider.rs`); hold лочит оба пути |
-| S3 | Поверхность: флаг в `af task run`, отдача в Studio, evidence-отчёт | Mock-LLM journey-тест; полный Kaggle Linux прогон; обновление `PRODUCTION_STATUS` |
+| S1a | Детерминированный каркас: типы EnrichmentRecord/NoAnswer/Completeness, revision-bound JSONL-кэш (`af-loop::enrich`), Unavailable не кэшируется (D2), NoAnswer первоклассный (D4) | Юнит-тесты крейта; af-loop зелёный локально |
+| S1b | Запись enrichment в журнал сессии: событие `enrichment` (EVENT_TYPES+1, call_id отсутствует — нейтрально для hold-леджеров); детерминированный путь пишет явный Unavailable (D2/D4). **Поле в VerificationReport перенесено в S3**: контракт frozen (`deny_unknown_fields` + pinned `schema_version`) — добавка поля = cross-language bump фикстур и TS-векторов, это отдельная приёмка | Journey-тест edit.rs + vocabulary-lock тест; af-journal и af-loop зелёные |
+| S2 | Live-проводка по D1–D2: enrichment через `AccountedBackend`; семантика hold/refusal/unknown; call_ref заполняется | Тесты на ScriptedBackend-обёртке (шаблон — тесты `trusted_provider.rs`); hold лочит оба пути |
+| S3 | Поверхность: флаг в `af task run`, отдача в Studio, поле enrichment в `VerificationReport` (bump wire-контракта: VERSION, фикстуры, TS-вектора) | Mock-LLM journey-тест; полный Kaggle Linux прогон; обновление `PRODUCTION_STATUS` |
 
 Live-валидация — после приёмки S1–S3, отдельной кампанией (D6).
 

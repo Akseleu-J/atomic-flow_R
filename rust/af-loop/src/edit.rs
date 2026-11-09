@@ -411,6 +411,30 @@ pub fn run_edit_task(
     }
     let journal =
         journal.ok_or("edit tasks require a durable journal before model or mutation effects")?;
+    // N05 (ADR-0002 D2/D6): live enrichment orchestration is not wired in this
+    // slice. The deterministic path records the explicit Unavailable outcome
+    // so an absent record can never read as "the model was silently skipped"
+    // (D4), and no cache entry is minted because unavailability is transient
+    // (D2). Slice S2 replaces this payload with the accounted live attempt.
+    journal
+        .append(
+            "enrichment",
+            &json!({
+                "kind": "tour",
+                "target": [],
+                "outcome": "unavailable",
+                "reason": "disabled",
+                "note": "live enrichment wiring lands in slice S2 (ADR-0002)"
+            }),
+            // No call_id and no top-level outcome: enrichment is not a model
+            // call, so it must stay classification-neutral for the pending /
+            // unresolved hold ledgers; the outcome vocabulary lives in the
+            // payload.
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("enrichment record persistence failed: {error}"))?;
     let tools: Vec<Box<dyn KernelTool + '_>> = vec![Box::new(RefCellTool(toolset))];
     let outcome = {
         let mut loop_ = TurnLoop::new(router, &tools, Some(&mut *journal), limits);
@@ -946,6 +970,64 @@ mod tests {
         }
         let on_disk = std::fs::read_to_string(temp.root.join("lib.py")).unwrap();
         assert!(on_disk.contains("return 2"));
+    }
+
+    #[test]
+    fn deterministic_path_records_explicit_unavailable_enrichment() {
+        let (temp, registry) = setup();
+        let toolset = toolset(&temp, &registry, 0, 4);
+        let backend = ScriptedBackend::new("scripted", vec![completed("done", vec![])]);
+        let router = Router::new(vec![Box::new(backend)]);
+        let (_home, mut journal) = {
+            std::env::set_var("ATOMIC_FLOW_HOME", &temp.home);
+            let project = temp.home.join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let journal =
+                af_journal::SessionJournal::create(&project, Some("guided"), None).unwrap();
+            std::env::remove_var("ATOMIC_FLOW_HOME");
+            ((), journal)
+        };
+        let outcome = run_edit_task(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            "m",
+            "noop task",
+            true,
+            LoopLimits::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        match outcome {
+            EditOutcome::Unverified { edits, .. } => assert_eq!(edits, 0),
+            other => panic!("expected unverified no-edit outcome, got {other:?}"),
+        }
+        let snapshot = journal.read().unwrap();
+        let enrichments: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == json!("enrichment"))
+            .collect();
+        assert_eq!(
+            enrichments.len(),
+            1,
+            "exactly one explicit enrichment record per journey (ADR-0002 D4)"
+        );
+        assert_eq!(enrichments[0]["payload"]["kind"], json!("tour"));
+        assert_eq!(enrichments[0]["payload"]["outcome"], json!("unavailable"));
+        assert_eq!(enrichments[0]["payload"]["reason"], json!("disabled"));
+        assert!(
+            enrichments[0]
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_none(),
+            "enrichment is not a model call and must not occupy the call ledger"
+        );
+        assert!(
+            snapshot.pending_call_ids().is_empty() && snapshot.unresolved_call_ids().is_empty(),
+            "an enrichment record must not create pending or unresolved holds"
+        );
     }
 
     #[test]

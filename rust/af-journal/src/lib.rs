@@ -18,7 +18,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 
-pub const EVENT_TYPES: [&str; 22] = [
+pub const EVENT_TYPES: [&str; 23] = [
     "session_created",
     "user_input",
     "model_request",
@@ -41,6 +41,10 @@ pub const EVENT_TYPES: [&str; 22] = [
     "rewind_applied",
     "fork_created",
     "host_reconciliation",
+    // N05 (ADR-0002): context-enrichment attempt/outcome record; never a
+    // model call itself (call_id stays None), so it is classification-neutral
+    // for pending/unresolved call ledgers.
+    "enrichment",
 ];
 
 const OUTCOMES: [&str; 8] = [

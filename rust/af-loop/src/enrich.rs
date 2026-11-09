@@ -421,6 +421,31 @@ mod tests {
     }
 
     #[test]
+    fn journal_payload_vocabulary_is_locked() {
+        // The session-journal "enrichment" event flattens EnrichmentOutcome's
+        // serde tag into the payload; this pins the vocabulary so the journal
+        // event and the cache record can never drift apart (ADR-0002 D2/D4).
+        let value = serde_json::to_value(EnrichmentOutcome::Unavailable {
+            reason: UnavailableReason::Disabled,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"outcome": "unavailable", "reason": "disabled"})
+        );
+        let value = serde_json::to_value(EnrichmentOutcome::NoAnswer {
+            reason: NoAnswerReason::NotRelevant,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"outcome": "no_answer", "reason": "not_relevant"})
+        );
+        let value = serde_json::to_value(EnrichmentKind::Tour).unwrap();
+        assert_eq!(value, serde_json::json!("tour"));
+    }
+
+    #[test]
     fn torn_tail_does_not_hide_earlier_entries() {
         let dir = temp_dir("torn");
         let path = dir.join("cache.jsonl");
