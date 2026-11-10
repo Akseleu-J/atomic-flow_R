@@ -87,6 +87,55 @@ impl JobSpec {
     }
 }
 
+/// Transport manifest for one opaque input bundle. Extraction and guest
+/// provisioning are separate operations.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InputManifest {
+    schema_version: u32,
+    bundle_sha256: String,
+    bundle_bytes: u64,
+}
+
+/// Owns the exact bytes that were verified, so an adapter need not reopen a
+/// filesystem path after checking its contents.
+pub struct VerifiedInput {
+    spec_digest: String,
+    bundle: Vec<u8>,
+}
+
+impl VerifiedInput {
+    pub fn verify(spec: &JobSpec, manifest: &[u8], bundle: Vec<u8>) -> Result<Self> {
+        spec.validate()?;
+        if manifest.len() > WIRE_LIMIT
+            || bundle.len() as u64 != spec.input_bytes
+            || format!("{:x}", Sha256::digest(manifest)) != spec.input_manifest_sha256
+        {
+            return Err(DurableQueueError(
+                "worker input does not match request".into(),
+            ));
+        }
+        let parsed: InputManifest = serde_json::from_slice(manifest)
+            .map_err(|_| DurableQueueError("invalid worker input manifest".into()))?;
+        if parsed.schema_version != 1
+            || parsed.bundle_bytes != spec.input_bytes
+            || format!("{:x}", Sha256::digest(&bundle)) != parsed.bundle_sha256
+        {
+            return Err(DurableQueueError(
+                "worker bundle does not match manifest".into(),
+            ));
+        }
+        Ok(Self {
+            spec_digest: spec.digest()?,
+            bundle,
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bundle
+    }
+}
+
 /// One trusted host configuration. Authentication and actual profile provisioning
 /// belong to the service that constructs it, outside the request body.
 pub struct Admission {
@@ -186,7 +235,17 @@ impl Admission {
     }
 
     /// Record a unique, host-selected runtime ID before any runtime effect.
-    pub fn start(&mut self, reservation: &Reservation, runtime_id: &str) -> Result<Entry> {
+    pub fn start(
+        &mut self,
+        reservation: &Reservation,
+        runtime_id: &str,
+        input: &VerifiedInput,
+    ) -> Result<Entry> {
+        if input.spec_digest != reservation.payload_digest {
+            return Err(DurableQueueError(
+                "verified input belongs to a different request".into(),
+            ));
+        }
         self.record(
             reservation,
             "worker_start",
@@ -253,14 +312,21 @@ mod tests {
     use super::*;
     use crate::durable_queue::EntryState;
 
-    fn spec() -> JobSpec {
-        JobSpec {
+    fn fixture() -> (JobSpec, Vec<u8>, Vec<u8>) {
+        let bundle = b"sample source".to_vec();
+        let manifest = serde_json::to_vec(&InputManifest {
+            schema_version: 1,
+            bundle_sha256: format!("{:x}", Sha256::digest(&bundle)),
+            bundle_bytes: bundle.len() as u64,
+        })
+        .unwrap();
+        let spec = JobSpec {
             schema_version: 1,
             operation_id: "op-1".into(),
             project_id: "project".into(),
             profile_sha256: "a".repeat(64),
-            input_manifest_sha256: "b".repeat(64),
-            input_bytes: 42,
+            input_manifest_sha256: format!("{:x}", Sha256::digest(&manifest)),
+            input_bytes: bundle.len() as u64,
             limits: Limits {
                 vcpus: 1,
                 memory_mib: 512,
@@ -268,7 +334,8 @@ mod tests {
                 timeout_secs: 60,
                 output_bytes: 1024,
             },
-        }
+        };
+        (spec, manifest, bundle)
     }
 
     #[test]
@@ -284,7 +351,8 @@ mod tests {
         let _temp = Temp(dir.clone());
         let path = dir.join("ledger.jsonl");
         DurableAdmission::create(&path).unwrap();
-        let first = spec();
+        let (first, manifest, bundle) = fixture();
+        let input = VerifiedInput::verify(&first, &manifest, bundle.clone()).unwrap();
         let open = |worker: &str| {
             Admission::open(
                 &path,
@@ -306,7 +374,7 @@ mod tests {
         assert!(b.submit(&conflict).is_err());
         let claim = a.reserve(&first).unwrap();
         assert!(b.reserve(&first).is_err());
-        assert!(b.start(&claim, "vm-1").is_err());
+        assert!(b.start(&claim, "vm-1", &input).is_err());
         let other_path = dir.join("other.jsonl");
         DurableAdmission::create(&other_path).unwrap();
         let mut other = Admission::open(
@@ -318,9 +386,9 @@ mod tests {
         )
         .unwrap();
         let _other_claim = other.reserve(&first).unwrap();
-        assert!(other.start(&claim, "vm-1").is_err());
+        assert!(other.start(&claim, "vm-1", &input).is_err());
         assert!(a.confirm_cleanup(&claim, &"c".repeat(64)).is_err());
-        a.start(&claim, "vm-1").unwrap();
+        a.start(&claim, "vm-1", &input).unwrap();
         a.finish(&claim, &"d".repeat(64)).unwrap();
         assert_eq!(
             open("worker-a").inspect("op-1").unwrap().state,
@@ -334,8 +402,10 @@ mod tests {
         let mut second = first.clone();
         second.operation_id = "op-2".into();
         let second_claim = a.reserve(&second).unwrap();
-        assert!(a.start(&second_claim, "vm-1").is_err());
-        a.start(&second_claim, "vm-2").unwrap();
+        assert!(a.start(&second_claim, "vm-2", &input).is_err());
+        let second_input = VerifiedInput::verify(&second, &manifest, bundle).unwrap();
+        assert!(a.start(&second_claim, "vm-1", &second_input).is_err());
+        a.start(&second_claim, "vm-2", &second_input).unwrap();
         a.mark_unknown(&second_claim).unwrap();
         let mut reopened = open("worker-a");
         assert_eq!(reopened.inspect("op-2").unwrap().state, EntryState::Unknown);
@@ -344,9 +414,27 @@ mod tests {
     }
 
     #[test]
+    fn input_verification_rejects_substitution() {
+        let (mut spec, mut manifest, mut bundle) = fixture();
+        let input = VerifiedInput::verify(&spec, &manifest, bundle.clone()).unwrap();
+        assert_eq!(input.bytes(), bundle);
+        bundle[0] ^= 1;
+        assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
+        bundle.pop();
+        assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
+        bundle = input.bytes().to_vec();
+        manifest.push(b' ');
+        assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
+        let invalid_manifest = br#"{"schema_version":1,"schema_version":1}"#;
+        spec.input_manifest_sha256 = format!("{:x}", Sha256::digest(invalid_manifest));
+        assert!(VerifiedInput::verify(&spec, invalid_manifest, bundle).is_err());
+    }
+
+    #[test]
     fn wire_refuses_duplicates_unknown_fields_and_invalid_limits() {
-        let raw = serde_json::to_string(&spec()).unwrap();
-        assert_eq!(JobSpec::parse(raw.as_bytes()).unwrap(), spec());
+        let (spec, _, _) = fixture();
+        let raw = serde_json::to_string(&spec).unwrap();
+        assert_eq!(JobSpec::parse(raw.as_bytes()).unwrap(), spec);
         assert!(JobSpec::parse(
             raw.replace(
                 "\"schema_version\":1",
