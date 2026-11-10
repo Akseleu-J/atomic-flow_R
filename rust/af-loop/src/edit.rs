@@ -395,6 +395,10 @@ fn hold_stale_requirement(
 /// checker this path never auto-commits, even when a diagnostic exits zero.
 // Preserve the existing API with explicit host authority and requirement-checker inputs.
 #[allow(clippy::too_many_arguments)]
+/// Run the guided edit journey on the deterministic path: no enrichment plan
+/// is supplied, so an explicit Unavailable enrichment record is journaled
+/// (ADR-0002 D2/D4) and no cache entry is minted.
+#[allow(clippy::too_many_arguments)]
 pub fn run_edit_task(
     router: &Router,
     toolset: &EditToolset,
@@ -406,35 +410,182 @@ pub fn run_edit_task(
     git: Option<&af_exec::git::GitWorkflow>,
     requirement: Option<&mut EditRequirement<'_>>,
 ) -> Result<EditOutcome, String> {
+    run_edit_task_journey(
+        router,
+        toolset,
+        journal,
+        model,
+        task,
+        host_approved,
+        limits,
+        git,
+        requirement,
+        None,
+    )
+}
+
+/// Run the guided edit journey with a host-built live enrichment plan
+/// (slice S2a, ADR-0002 D1-D3): a revision-bound cache hit never calls the
+/// model, otherwise a single router-accounted call is attempted and its
+/// outcome is pinned — answers/no-answers enter the cache, unavailability
+/// never does.
+#[allow(clippy::too_many_arguments)]
+pub fn run_edit_task_with_enrichment(
+    router: &Router,
+    toolset: &EditToolset,
+    journal: Option<&mut af_journal::SessionJournal>,
+    model: &str,
+    task: &str,
+    host_approved: bool,
+    limits: LoopLimits,
+    git: Option<&af_exec::git::GitWorkflow>,
+    requirement: Option<&mut EditRequirement<'_>>,
+    enrichment: &crate::enrich::EnrichmentPlan,
+) -> Result<EditOutcome, String> {
+    run_edit_task_journey(
+        router,
+        toolset,
+        journal,
+        model,
+        task,
+        host_approved,
+        limits,
+        git,
+        requirement,
+        Some(enrichment),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_edit_task_journey(
+    router: &Router,
+    toolset: &EditToolset,
+    journal: Option<&mut af_journal::SessionJournal>,
+    model: &str,
+    task: &str,
+    host_approved: bool,
+    limits: LoopLimits,
+    git: Option<&af_exec::git::GitWorkflow>,
+    requirement: Option<&mut EditRequirement<'_>>,
+    enrichment: Option<&crate::enrich::EnrichmentPlan>,
+) -> Result<EditOutcome, String> {
     if !host_approved {
         return Err("edit tasks require explicit host approval for sandbox apply".into());
     }
     let journal =
         journal.ok_or("edit tasks require a durable journal before model or mutation effects")?;
-    // N05 (ADR-0002 D2/D6): live enrichment orchestration is not wired in this
-    // slice. The deterministic path records the explicit Unavailable outcome
-    // so an absent record can never read as "the model was silently skipped"
-    // (D4), and no cache entry is minted because unavailability is transient
-    // (D2). Slice S2 replaces this payload with the accounted live attempt.
-    journal
-        .append(
-            "enrichment",
-            &json!({
-                "kind": "tour",
-                "target": [],
-                "outcome": "unavailable",
-                "reason": "disabled",
-                "note": "live enrichment wiring lands in slice S2 (ADR-0002)"
-            }),
-            // No call_id and no top-level outcome: enrichment is not a model
-            // call, so it must stay classification-neutral for the pending /
-            // unresolved hold ledgers; the outcome vocabulary lives in the
-            // payload.
-            None,
-            None,
-            None,
-        )
-        .map_err(|error| format!("enrichment record persistence failed: {error}"))?;
+    // Enrichment (ADR-0002 D2-D4). With a plan: a revision-bound cache hit is
+    // reused without any model call; otherwise one router-accounted call is
+    // attempted, parsed and pinned — answers/no-answers enter the cache,
+    // unavailability never does (transient). Without a plan (deterministic
+    // path): only the explicit Unavailable record. A hold observed here is
+    // enforced by the accounted backend itself on every later send; call_ref
+    // threading from the ledger arrives with the af-cli slice (S2b).
+    let mut enrichment_prefix = String::new();
+    match enrichment {
+        Some(plan) => {
+            let key = crate::enrich::EnrichmentKey::new(
+                plan.root_id.clone(),
+                plan.revision.clone(),
+                plan.target.clone(),
+                crate::enrich::EnrichmentKind::Tour,
+                model,
+                plan.prompt_schema,
+            );
+            let (mut cache, _) = crate::enrich::EnrichmentCache::open(&plan.cache_path);
+            if let Some(record) = cache.get(&key).cloned() {
+                journal
+                    .append(
+                        "enrichment",
+                        &crate::enrich::journal_payload(
+                            crate::enrich::EnrichmentKind::Tour,
+                            &plan.target,
+                            &record.outcome,
+                            true,
+                            None,
+                        ),
+                        None,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| format!("enrichment record persistence failed: {error}"))?;
+                if let crate::enrich::EnrichmentOutcome::Answer(answer) = record.outcome {
+                    enrichment_prefix = format!("Context enrichment (tour):\n{}\n\n", answer.text);
+                }
+            } else {
+                let request = af_llm::ChatRequest::new(
+                    model,
+                    vec![ChatMessage::new(
+                        "user",
+                        &crate::enrich::enrichment_prompt(task, &plan.target),
+                    )],
+                );
+                let (outcome, note) = match router.route(&request, &Cancel::new()) {
+                    af_llm::RouteOutcome::Completed { result, .. } => (
+                        crate::enrich::parse_enrichment_response(&result.content),
+                        None,
+                    ),
+                    af_llm::RouteOutcome::Hold { detail, .. } => (
+                        crate::enrich::EnrichmentOutcome::Unavailable {
+                            reason: crate::enrich::UnavailableReason::BudgetHold,
+                        },
+                        Some(format!("route hold: {detail}")),
+                    ),
+                    af_llm::RouteOutcome::Exhausted { refusals } => (
+                        crate::enrich::EnrichmentOutcome::Unavailable {
+                            reason: crate::enrich::UnavailableReason::BudgetRefused,
+                        },
+                        Some(format!("route exhausted: {}", refusals.join("; "))),
+                    ),
+                };
+                if outcome.is_cache_worthy() {
+                    cache
+                        .insert(crate::enrich::EnrichmentRecord::mint(key, outcome.clone()))
+                        .map_err(|error| format!("enrichment cache write failed: {error}"))?;
+                }
+                journal
+                    .append(
+                        "enrichment",
+                        &crate::enrich::journal_payload(
+                            crate::enrich::EnrichmentKind::Tour,
+                            &plan.target,
+                            &outcome,
+                            false,
+                            note.as_deref(),
+                        ),
+                        None,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| format!("enrichment record persistence failed: {error}"))?;
+                if let crate::enrich::EnrichmentOutcome::Answer(answer) = outcome {
+                    enrichment_prefix = format!("Context enrichment (tour):\n{}\n\n", answer.text);
+                }
+            }
+        }
+        None => {
+            journal
+                .append(
+                    "enrichment",
+                    &crate::enrich::journal_payload(
+                        crate::enrich::EnrichmentKind::Tour,
+                        &[],
+                        &crate::enrich::EnrichmentOutcome::Unavailable {
+                            reason: crate::enrich::UnavailableReason::Disabled,
+                        },
+                        false,
+                        Some("live enrichment wiring lands in slice S2b (ADR-0002)"),
+                    ),
+                    // No call_id and no top-level outcome: enrichment is not a
+                    // model call, so it must stay classification-neutral for
+                    // the pending/unresolved hold ledgers.
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|error| format!("enrichment record persistence failed: {error}"))?;
+        }
+    }
     let tools: Vec<Box<dyn KernelTool + '_>> = vec![Box::new(RefCellTool(toolset))];
     let outcome = {
         let mut loop_ = TurnLoop::new(router, &tools, Some(&mut *journal), limits);
@@ -444,7 +595,7 @@ pub fn run_edit_task(
                 vec![ChatMessage::new(
                     "user",
                     &format!(
-                        "Task: {task}\nTools: context (repo map), read_file, apply_edit, run_check.\n\
+                        "{enrichment_prefix}Task: {task}\nTools: context (repo map), read_file, apply_edit, run_check.\n\
                      Rules: read the complete file before apply_edit; run_check after edits;\n\
                      finish with a final answer only when the check passes."
                     ),
@@ -1028,6 +1179,215 @@ mod tests {
             snapshot.pending_call_ids().is_empty() && snapshot.unresolved_call_ids().is_empty(),
             "an enrichment record must not create pending or unresolved holds"
         );
+    }
+
+    fn plan(cache_path: std::path::PathBuf, revision: &str) -> crate::enrich::EnrichmentPlan {
+        crate::enrich::EnrichmentPlan {
+            root_id: "main".to_string(),
+            revision: revision.to_string(),
+            target: vec![],
+            model: "m".to_string(),
+            prompt_schema: 1,
+            cache_path,
+        }
+    }
+
+    fn guided_journal(home: &std::path::Path, name: &str) -> af_journal::SessionJournal {
+        std::env::set_var("ATOMIC_FLOW_HOME", home);
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let journal = af_journal::SessionJournal::create(&project, Some(name), None).unwrap();
+        std::env::remove_var("ATOMIC_FLOW_HOME");
+        journal
+    }
+
+    #[test]
+    fn live_plan_answer_is_pinned_cached_and_then_served_without_a_call() {
+        let (temp, registry) = setup();
+        let toolset = toolset(&temp, &registry, 0, 4);
+        let cache_path = temp.home.join("enrich.jsonl");
+        let p = plan(cache_path.clone(), "rev1");
+        let backend = ScriptedBackend::new(
+            "scripted",
+            vec![
+                completed(
+                    r#"{"answer":"tour: one module","coverage":["lib.py"],"completeness":"full"}"#,
+                    vec![],
+                ),
+                completed("done", vec![]),
+            ],
+        );
+        let router = Router::new(vec![Box::new(backend)]);
+        let mut journal = guided_journal(&temp.home, "guided-1");
+        let outcome = run_edit_task_with_enrichment(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            "m",
+            "noop task",
+            true,
+            LoopLimits::default(),
+            None,
+            None,
+            &p,
+        )
+        .unwrap();
+        match outcome {
+            EditOutcome::Unverified { content, edits, .. } => {
+                assert_eq!(edits, 0);
+                assert_eq!(content, "done");
+            }
+            other => panic!("expected unverified no-edit outcome, got {other:?}"),
+        }
+        let snapshot = journal.read().unwrap();
+        let enrichments: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == json!("enrichment"))
+            .collect();
+        assert_eq!(enrichments.len(), 1);
+        assert_eq!(enrichments[0]["payload"]["outcome"], json!("answer"));
+        assert_eq!(enrichments[0]["payload"]["cached"], json!(false));
+        assert_eq!(enrichments[0]["payload"]["completeness"], json!("full"));
+        let (cache, stats) = crate::enrich::EnrichmentCache::open(&cache_path);
+        assert_eq!(stats.records, 1, "answer must be cached");
+
+        // Second journey on the same revision: the cached answer is served
+        // with zero model calls (D3) — the scripted backend's only outcome is
+        // consumed by the loop, not by enrichment.
+        let backend2 = ScriptedBackend::new("scripted", vec![completed("done2", vec![])]);
+        let router2 = Router::new(vec![Box::new(backend2)]);
+        let mut journal2 = guided_journal(&temp.home, "guided-2");
+        let outcome2 = run_edit_task_with_enrichment(
+            &router2,
+            &toolset,
+            Some(&mut journal2),
+            "m",
+            "noop task",
+            true,
+            LoopLimits::default(),
+            None,
+            None,
+            &p,
+        )
+        .unwrap();
+        match outcome2 {
+            EditOutcome::Unverified { content, .. } => assert_eq!(content, "done2"),
+            other => panic!("expected unverified no-edit outcome, got {other:?}"),
+        }
+        let snapshot2 = journal2.read().unwrap();
+        let enrichments2: Vec<_> = snapshot2
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == json!("enrichment"))
+            .collect();
+        assert_eq!(enrichments2.len(), 1);
+        assert_eq!(enrichments2[0]["payload"]["cached"], json!(true));
+        assert_eq!(enrichments2[0]["payload"]["outcome"], json!("answer"));
+        let (_, stats2) = crate::enrich::EnrichmentCache::open(&cache_path);
+        assert_eq!(stats2.records, 1, "cache hit must not duplicate entries");
+    }
+
+    #[test]
+    fn garbage_enrichment_response_is_a_first_class_no_answer() {
+        let (temp, registry) = setup();
+        let toolset = toolset(&temp, &registry, 0, 4);
+        let cache_path = temp.home.join("enrich.jsonl");
+        let p = plan(cache_path.clone(), "rev1");
+        let backend = ScriptedBackend::new(
+            "scripted",
+            vec![
+                completed("I think the module looks fine", vec![]),
+                completed("done", vec![]),
+            ],
+        );
+        let router = Router::new(vec![Box::new(backend)]);
+        let mut journal = guided_journal(&temp.home, "guided-1");
+        run_edit_task_with_enrichment(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            "m",
+            "noop task",
+            true,
+            LoopLimits::default(),
+            None,
+            None,
+            &p,
+        )
+        .unwrap();
+        let snapshot = journal.read().unwrap();
+        let enrichments: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == json!("enrichment"))
+            .collect();
+        assert_eq!(enrichments[0]["payload"]["outcome"], json!("no_answer"));
+        assert_eq!(
+            enrichments[0]["payload"]["reason"],
+            json!({"other": "unparseable enrichment response"})
+        );
+        let (cache, stats) = crate::enrich::EnrichmentCache::open(&cache_path);
+        assert_eq!(stats.records, 1, "no-answer is pinned like an answer (D4)");
+        assert!(cache
+            .get(&crate::enrich::EnrichmentKey::new(
+                "main",
+                "rev1",
+                vec![],
+                crate::enrich::EnrichmentKind::Tour,
+                "m",
+                1
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn enrichment_hold_is_recorded_and_never_cached() {
+        let (temp, registry) = setup();
+        let toolset = toolset(&temp, &registry, 0, 4);
+        let cache_path = temp.home.join("enrich.jsonl");
+        let p = plan(cache_path.clone(), "rev1");
+        let backend = ScriptedBackend::new(
+            "scripted",
+            vec![
+                af_llm::BackendOutcome::Unknown {
+                    sent: true,
+                    detail: "transport died".to_string(),
+                },
+                completed("done", vec![]),
+            ],
+        );
+        let router = Router::new(vec![Box::new(backend)]);
+        let mut journal = guided_journal(&temp.home, "guided-1");
+        run_edit_task_with_enrichment(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            "m",
+            "noop task",
+            true,
+            LoopLimits::default(),
+            None,
+            None,
+            &p,
+        )
+        .unwrap();
+        let snapshot = journal.read().unwrap();
+        let enrichments: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == json!("enrichment"))
+            .collect();
+        assert_eq!(enrichments[0]["payload"]["outcome"], json!("unavailable"));
+        assert_eq!(enrichments[0]["payload"]["reason"], json!("budget_hold"));
+        assert!(
+            enrichments[0]["payload"]["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("transport died")),
+            "the hold detail must be preserved verbatim"
+        );
+        let (_, stats) = crate::enrich::EnrichmentCache::open(&cache_path);
+        assert_eq!(stats.records, 0, "unavailable is never cached (D2)");
     }
 
     #[test]

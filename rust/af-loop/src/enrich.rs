@@ -259,6 +259,129 @@ impl EnrichmentCache {
     }
 }
 
+/// Host-built plan for one live enrichment attempt (slice S2a). Built only
+/// by the caller that selected a live provider; the deterministic path uses
+/// no plan at all.
+pub struct EnrichmentPlan {
+    pub root_id: String,
+    /// Graph/commit revision the attempt and its cache entries bind to (D3).
+    pub revision: String,
+    pub target: Vec<String>,
+    pub model: String,
+    pub prompt_schema: u32,
+    /// Append-only cache file for this root (revision-bound entries).
+    pub cache_path: PathBuf,
+}
+
+/// Prompt schema v1: the enrichment ask, worded so a compliant model replies
+/// with strict JSON (see `parse_enrichment_response`).
+pub fn enrichment_prompt(task: &str, target: &[String]) -> String {
+    let targets = if target.is_empty() {
+        "(whole task scope)".to_string()
+    } else {
+        target.join(", ")
+    };
+    format!(
+        "You enrich code-edit context. Target: {targets}.\n\
+         Task: {task}\n\
+         Reply with STRICT JSON only, no surrounding prose:\n\
+         {{\"answer\": \"<short tour/impact summary>\", \"coverage\": [\"<path or symbol>\", ...], \
+         \"completeness\": \"full\" | \"partial\" | \"none\", \"missing\": [\"<path>\", ...]}}\n\
+         If nothing in the target is relevant to the task, reply exactly: \
+         {{\"no_answer\": true, \"reason\": \"not_relevant\"}}"
+    )
+}
+
+/// Parse a model response under prompt schema v1. An empty or unparseable
+/// response is a first-class `NoAnswer` (D4): the call happened and is
+/// pinned; it is never retried here.
+pub fn parse_enrichment_response(content: &str) -> EnrichmentOutcome {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return EnrichmentOutcome::NoAnswer {
+            reason: NoAnswerReason::EmptyResponse,
+        };
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return EnrichmentOutcome::NoAnswer {
+            reason: NoAnswerReason::Other("unparseable enrichment response".into()),
+        };
+    };
+    if value.get("no_answer").and_then(serde_json::Value::as_bool) == Some(true) {
+        let reason = match value.get("reason").and_then(serde_json::Value::as_str) {
+            Some("not_relevant") | None => NoAnswerReason::NotRelevant,
+            Some(other) => NoAnswerReason::Other(other.to_string()),
+        };
+        return EnrichmentOutcome::NoAnswer { reason };
+    }
+    let Some(answer) = value.get("answer").and_then(serde_json::Value::as_str) else {
+        return EnrichmentOutcome::NoAnswer {
+            reason: NoAnswerReason::Other("missing answer field".into()),
+        };
+    };
+    if answer.trim().is_empty() {
+        return EnrichmentOutcome::NoAnswer {
+            reason: NoAnswerReason::EmptyResponse,
+        };
+    }
+    let strings = |field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let completeness = match value
+        .get("completeness")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("full") => Completeness::Full,
+        Some("none") => Completeness::None,
+        _ => Completeness::Partial {
+            missing: strings("missing"),
+        },
+    };
+    EnrichmentOutcome::Answer(EnrichmentAnswer {
+        text: answer.to_string(),
+        coverage: strings("coverage"),
+        completeness,
+    })
+}
+
+/// Flat journal payload for an enrichment record: the outcome vocabulary is
+/// flattened into the event payload (pinned by the vocabulary-lock test) so
+/// the journal and the cache can never drift apart.
+pub fn journal_payload(
+    kind: EnrichmentKind,
+    target: &[String],
+    outcome: &EnrichmentOutcome,
+    cached: bool,
+    note: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "kind": kind,
+        "target": target,
+        "cached": cached,
+    });
+    if let serde_json::Value::Object(fields) =
+        serde_json::to_value(outcome).expect("outcome serializes")
+    {
+        for (field, item) in fields {
+            value[field] = item;
+        }
+    }
+    if let Some(note) = note {
+        value["note"] = serde_json::json!(note);
+    }
+    value
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -418,6 +541,50 @@ mod tests {
             "transient state must not be cached"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn prompt_schema_v1_parsing() {
+        let answer = parse_enrichment_response(
+            r#"{"answer":"tour: one module","coverage":["lib.py"],"completeness":"partial","missing":["a.rs"]}"#,
+        );
+        match answer {
+            EnrichmentOutcome::Answer(a) => {
+                assert_eq!(a.text, "tour: one module");
+                assert_eq!(a.coverage, vec!["lib.py".to_string()]);
+                assert_eq!(
+                    a.completeness,
+                    Completeness::Partial {
+                        missing: vec!["a.rs".to_string()]
+                    }
+                );
+            }
+            other => panic!("expected answer, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_enrichment_response(r#"{"no_answer": true, "reason": "not_relevant"}"#),
+            EnrichmentOutcome::NoAnswer {
+                reason: NoAnswerReason::NotRelevant
+            }
+        ));
+        assert!(matches!(
+            parse_enrichment_response("   "),
+            EnrichmentOutcome::NoAnswer {
+                reason: NoAnswerReason::EmptyResponse
+            }
+        ));
+        assert!(matches!(
+            parse_enrichment_response("I think the module looks fine"),
+            EnrichmentOutcome::NoAnswer {
+                reason: NoAnswerReason::Other(_)
+            }
+        ));
+        assert!(matches!(
+            parse_enrichment_response(r#"{"completeness":"full"}"#),
+            EnrichmentOutcome::NoAnswer {
+                reason: NoAnswerReason::Other(_)
+            }
+        ));
     }
 
     #[test]
