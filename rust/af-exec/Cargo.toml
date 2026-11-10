@@ -9,3 +9,5 @@ description = "Durable job runner with unknown-outcome reconciliation latch (job
 serde_json.workspace = true
 thiserror.workspace = true
 af-entropy.workspace = true
+serde.workspace = true
+sha2.workspace = true

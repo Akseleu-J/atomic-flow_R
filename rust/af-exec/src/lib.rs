@@ -21,6 +21,7 @@ pub mod durable_queue;
 pub mod git;
 mod process;
 pub mod queue;
+pub mod worker;
 
 pub const STATUS_SCHEMA_VERSION: i64 = 1;
 

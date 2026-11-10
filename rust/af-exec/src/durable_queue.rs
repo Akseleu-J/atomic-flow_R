@@ -24,6 +24,10 @@ pub enum EntryState {
     Reserved,
     Completed,
     Failed,
+    Running,
+    Finished,
+    CleanupConfirmed,
+    Unknown,
 }
 impl EntryState {
     pub fn as_str(self) -> &'static str {
@@ -32,6 +36,10 @@ impl EntryState {
             EntryState::Reserved => "reserved",
             EntryState::Completed => "completed",
             EntryState::Failed => "failed",
+            EntryState::Running => "running",
+            EntryState::Finished => "finished",
+            EntryState::CleanupConfirmed => "cleanup_confirmed",
+            EntryState::Unknown => "unknown",
         }
     }
 }
@@ -48,6 +56,8 @@ pub struct Entry {
     pub worker: Option<String>,
     pub reservation_fence: Option<u64>,
     pub receipt_digest: Option<String>,
+    pub runtime_id: Option<String>,
+    pub cleanup_digest: Option<String>,
     pub sequence: u64,
 }
 
@@ -232,7 +242,7 @@ fn validate_op(op: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .ok_or(DurableQueueError("operation kind missing".into()))?;
     let (expected, id_fields, digest_fields): (&[&str], &[&str], &[&str]) = match kind {
-        "submit" => (
+        "submit" | "worker_submit" => (
             &[
                 "kind",
                 "entry_id",
@@ -265,6 +275,44 @@ fn validate_op(op: &Value) -> Result<()> {
             &["entry_id", "worker"],
             &[],
         ),
+        "worker_start" => (
+            &[
+                "kind",
+                "entry_id",
+                "worker",
+                "reservation_fence",
+                "runtime_id",
+            ],
+            &["entry_id", "worker", "runtime_id"],
+            &[],
+        ),
+        "worker_finish" => (
+            &[
+                "kind",
+                "entry_id",
+                "worker",
+                "reservation_fence",
+                "receipt_digest",
+            ],
+            &["entry_id", "worker"],
+            &["receipt_digest"],
+        ),
+        "worker_cleanup" => (
+            &[
+                "kind",
+                "entry_id",
+                "worker",
+                "reservation_fence",
+                "cleanup_digest",
+            ],
+            &["entry_id", "worker"],
+            &["cleanup_digest"],
+        ),
+        "worker_unknown" => (
+            &["kind", "entry_id", "worker", "reservation_fence"],
+            &["entry_id", "worker"],
+            &[],
+        ),
         "fence" => (&["kind", "fence_id"], &["fence_id"], &[]),
         other => return Err(DurableQueueError(format!("unknown operation kind {other}"))),
     };
@@ -288,16 +336,23 @@ fn validate_op(op: &Value) -> Result<()> {
             return Err(DurableQueueError(format!("invalid {field} digest")));
         }
     }
-    if kind == "submit" && op["priority"].as_i64().is_none() {
+    if matches!(kind, "submit" | "worker_submit") && op["priority"].as_i64().is_none() {
         return Err(DurableQueueError(
             "priority must be a signed integer".into(),
         ));
     }
-    if matches!(kind, "complete" | "fail")
-        && op["reservation_fence"]
-            .as_u64()
-            .filter(|epoch| *epoch > 0)
-            .is_none()
+    if matches!(
+        kind,
+        "complete"
+            | "fail"
+            | "worker_start"
+            | "worker_finish"
+            | "worker_cleanup"
+            | "worker_unknown"
+    ) && op["reservation_fence"]
+        .as_u64()
+        .filter(|epoch| *epoch > 0)
+        .is_none()
     {
         return Err(DurableQueueError(
             "reservation fence must be a positive integer".into(),
@@ -337,7 +392,7 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
         ));
     }
     match kind {
-        "submit" => {
+        "submit" | "worker_submit" => {
             let entry_id = op["entry_id"].as_str().unwrap_or_default().to_string();
             let idempotency_key = op["idempotency_key"]
                 .as_str()
@@ -363,7 +418,12 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
                 Entry {
                     entry_id,
                     task_id: op["task_id"].as_str().unwrap_or_default().into(),
-                    kind: "task".into(),
+                    kind: if kind == "worker_submit" {
+                        "worker"
+                    } else {
+                        "task"
+                    }
+                    .into(),
                     idempotency_key,
                     priority: op["priority"].as_i64().unwrap_or(0),
                     payload_digest: op["payload_digest"].as_str().unwrap_or_default().into(),
@@ -371,6 +431,8 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
                     worker: None,
                     reservation_fence: None,
                     receipt_digest: None,
+                    runtime_id: None,
+                    cleanup_digest: None,
                     sequence,
                 },
             );
@@ -397,7 +459,7 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
                 .entries
                 .get_mut(entry_id)
                 .ok_or(DurableQueueError(format!("unknown entry {entry_id}")))?;
-            if entry.state != EntryState::Reserved {
+            if entry.kind != "task" || entry.state != EntryState::Reserved {
                 return Err(DurableQueueError(format!(
                     "entry {entry_id} is {}, not reserved",
                     entry.state.as_str()
@@ -413,7 +475,7 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
                 .entries
                 .get_mut(entry_id)
                 .ok_or(DurableQueueError(format!("unknown entry {entry_id}")))?;
-            if entry.state != EntryState::Reserved {
+            if entry.kind != "task" || entry.state != EntryState::Reserved {
                 return Err(DurableQueueError(format!(
                     "entry {entry_id} is {}, not reserved",
                     entry.state.as_str()
@@ -421,6 +483,50 @@ fn apply(state: &mut Snapshot, sequence: u64, op: &Value) -> Result<()> {
             }
             check_reservation(entry, op)?;
             entry.state = EntryState::Failed;
+        }
+        "worker_start" | "worker_finish" | "worker_cleanup" | "worker_unknown" => {
+            if kind == "worker_start"
+                && state
+                    .entries
+                    .values()
+                    .any(|entry| entry.runtime_id.as_deref() == op["runtime_id"].as_str())
+            {
+                return Err(DurableQueueError(
+                    "worker runtime identity already used".into(),
+                ));
+            }
+            let entry = state
+                .entries
+                .get_mut(op["entry_id"].as_str().unwrap_or_default())
+                .ok_or_else(|| DurableQueueError("worker entry unavailable".into()))?;
+            check_reservation(entry, op)?;
+            if entry.kind != "worker" {
+                return Err(DurableQueueError(
+                    "worker transition requires a worker entry".into(),
+                ));
+            }
+            match (kind, entry.state) {
+                ("worker_start", EntryState::Reserved) => {
+                    entry.runtime_id = op["runtime_id"].as_str().map(str::to_owned);
+                    entry.state = EntryState::Running;
+                }
+                ("worker_finish", EntryState::Running) => {
+                    entry.receipt_digest = op["receipt_digest"].as_str().map(str::to_owned);
+                    entry.state = EntryState::Finished;
+                }
+                ("worker_cleanup", EntryState::Finished) => {
+                    entry.cleanup_digest = op["cleanup_digest"].as_str().map(str::to_owned);
+                    entry.state = EntryState::CleanupConfirmed;
+                }
+                ("worker_unknown", EntryState::Running | EntryState::Finished) => {
+                    entry.state = EntryState::Unknown;
+                }
+                _ => {
+                    return Err(DurableQueueError(
+                        "invalid worker lifecycle transition".into(),
+                    ))
+                }
+            }
         }
         "fence" => {
             let declared = op
@@ -583,7 +689,7 @@ impl DurableAdmission {
         Ok(state)
     }
 
-    fn transition(&mut self, op: Value) -> Result<Snapshot> {
+    pub(crate) fn transition(&mut self, op: Value) -> Result<Snapshot> {
         if self.poisoned {
             return Err(DurableQueueError(
                 "queue persistence uncertain; no effects authorized".into(),
@@ -593,7 +699,7 @@ impl DurableAdmission {
         validate_op(&op)?;
         let _lease = lease(&self.path)?;
         let mut state = self.load()?;
-        if op["kind"] == "submit" {
+        if matches!(op["kind"].as_str(), Some("submit" | "worker_submit")) {
             let entry_id = op["entry_id"].as_str().unwrap_or_default();
             let key = op["idempotency_key"].as_str().unwrap_or_default();
             let by_id = state.entries.get(entry_id);
@@ -605,7 +711,9 @@ impl DurableAdmission {
                 let original = by_key.ok_or(DurableQueueError(
                     "entry identity conflicts with original submission".into(),
                 ))?;
-                if by_id.is_some_and(|entry| entry.entry_id != original.entry_id)
+                let worker = op["kind"] == "worker_submit";
+                if (original.kind == "worker") != worker
+                    || by_id.is_some_and(|entry| entry.entry_id != original.entry_id)
                     || original.task_id != op["task_id"].as_str().unwrap_or_default()
                     || original.priority != op["priority"].as_i64().unwrap()
                     || original.payload_digest != op["payload_digest"].as_str().unwrap_or_default()
