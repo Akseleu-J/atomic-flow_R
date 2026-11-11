@@ -30,6 +30,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           profile: minimal
+      - name: Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
       - name: Record source
         shell: bash
         run: |
@@ -40,17 +45,43 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
-        run: cargo build --release -p af-cli
+        run: cargo build --release -p af-cli --locked
       - name: Smoke the binary
         shell: bash
         run: |
           rust/target/release/${{ matrix.binary }} --version
           rust/target/release/${{ matrix.binary }} self-test
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          node-version: '22'
+      - name: Build and smoke engineer beta archive
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -o pipefail
+          npm --prefix ts/af-client ci --ignore-scripts --no-fund --no-audit
+          npm --prefix ts/af-client run build
+          npm --prefix ts/af-studio ci --ignore-scripts --no-fund --no-audit
+          npm --prefix ts/af-studio run build
+          mkdir -p beta
+          python tools/package_beta.py --binary rust/target/release/${{ matrix.binary }} \
+            --studio ts/af-studio/dist --output beta/atomic-flow-beta-${{ matrix.os }}.zip \
+            | tee beta/smoke.txt
+          tail -n 1 beta/smoke.txt > beta/SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: engineer-beta-${{ matrix.os }}
+          path: beta/
       - name: Package (windows zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
           Copy-Item rust/target/release/af.exe dist/
           Compress-Archive -Path dist/af.exe, dist/commit.txt -DestinationPath dist/${{ matrix.artifact }}
       - name: Package (linux tar.gz)
@@ -75,7 +106,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:

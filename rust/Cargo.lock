@@ -172,6 +172,8 @@ dependencies = [
  "af-entropy",
  "af-graph",
  "af-llm",
+ "ring",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

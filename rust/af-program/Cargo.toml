@@ -13,3 +13,5 @@ af-entropy.workspace = true
 af-graph.workspace = true
 af-agents.workspace = true
 af-llm.workspace = true
+serde.workspace = true
+ring = "0.17"

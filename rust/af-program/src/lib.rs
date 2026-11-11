@@ -10,6 +10,7 @@
 //! - [`corporate`]: E03/E05/E06/E08 — principal scoping, egress policy,
 //!   backend conformance, headless multi-principal acceptance
 
+pub mod beta_access;
 pub mod corporate;
 pub mod eval;
 pub mod governance;

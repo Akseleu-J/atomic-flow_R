@@ -5,6 +5,8 @@ use crate::durable_queue::{DurableAdmission, DurableQueueError, Entry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 const WIRE_LIMIT: usize = 8192;
@@ -87,14 +89,83 @@ impl JobSpec {
     }
 }
 
-/// Transport manifest for one opaque input bundle. Extraction and guest
-/// provisioning are separate operations.
+/// Transport manifest for concatenated regular files in manifest order.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InputManifest {
     schema_version: u32,
     bundle_sha256: String,
     bundle_bytes: u64,
+    files: Vec<InputFile>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InputFile {
+    path: String,
+    bytes: usize,
+}
+
+fn portable_component(component: &str) -> bool {
+    let base = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let device = matches!(base.as_str(), "con" | "prn" | "aux" | "nul")
+        || ((base.starts_with("com") || base.starts_with("lpt"))
+            && base.len() == 4
+            && base.as_bytes()[3].is_ascii_digit());
+    !device
+        && (1..=100).contains(&component.len())
+        && !component.starts_with('.')
+        && !component.ends_with('.')
+        && component
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+fn file_ranges(files: Vec<InputFile>, bundle_len: usize) -> Result<Vec<(String, Range<usize>)>> {
+    let mut paths = BTreeMap::new();
+    let mut offset = 0usize;
+    let mut ranges = Vec::new();
+    let invalid = || DurableQueueError("invalid worker file inventory".into());
+    for file in files {
+        if file.path.len() > 240 {
+            return Err(invalid());
+        }
+        let mut prefix = String::new();
+        let mut components = file.path.split('/').peekable();
+        while let Some(component) = components.next() {
+            if !portable_component(component) {
+                return Err(invalid());
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let is_file = components.peek().is_none();
+            let entry = paths.entry(prefix.to_ascii_lowercase());
+            match entry {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((prefix.clone(), is_file));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if !is_file && entry.get() == &(prefix.clone(), false) => {}
+                _ => return Err(invalid()),
+            }
+        }
+        let end = offset
+            .checked_add(file.bytes)
+            .filter(|end| *end <= bundle_len)
+            .ok_or_else(invalid)?;
+        ranges.push((file.path, offset..end));
+        offset = end;
+    }
+    if ranges.is_empty() || offset != bundle_len {
+        return Err(invalid());
+    }
+    Ok(ranges)
 }
 
 /// Owns the exact bytes that were verified, so an adapter need not reopen a
@@ -102,6 +173,7 @@ struct InputManifest {
 pub struct VerifiedInput {
     spec_digest: String,
     bundle: Vec<u8>,
+    files: Vec<(String, Range<usize>)>,
 }
 
 impl VerifiedInput {
@@ -117,7 +189,7 @@ impl VerifiedInput {
         }
         let parsed: InputManifest = serde_json::from_slice(manifest)
             .map_err(|_| DurableQueueError("invalid worker input manifest".into()))?;
-        if parsed.schema_version != 1
+        if parsed.schema_version != 2
             || parsed.bundle_bytes != spec.input_bytes
             || format!("{:x}", Sha256::digest(&bundle)) != parsed.bundle_sha256
         {
@@ -125,14 +197,18 @@ impl VerifiedInput {
                 "worker bundle does not match manifest".into(),
             ));
         }
+        let files = file_ranges(parsed.files, bundle.len())?;
         Ok(Self {
             spec_digest: spec.digest()?,
             bundle,
+            files,
         })
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.bundle
+    pub fn files(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.files
+            .iter()
+            .map(|(path, range)| (path.as_str(), &self.bundle[range.clone()]))
     }
 }
 
@@ -315,9 +391,13 @@ mod tests {
     fn fixture() -> (JobSpec, Vec<u8>, Vec<u8>) {
         let bundle = b"sample source".to_vec();
         let manifest = serde_json::to_vec(&InputManifest {
-            schema_version: 1,
+            schema_version: 2,
             bundle_sha256: format!("{:x}", Sha256::digest(&bundle)),
             bundle_bytes: bundle.len() as u64,
+            files: vec![InputFile {
+                path: "src/main.rs".into(),
+                bytes: bundle.len(),
+            }],
         })
         .unwrap();
         let spec = JobSpec {
@@ -417,17 +497,60 @@ mod tests {
     fn input_verification_rejects_substitution() {
         let (mut spec, mut manifest, mut bundle) = fixture();
         let input = VerifiedInput::verify(&spec, &manifest, bundle.clone()).unwrap();
-        assert_eq!(input.bytes(), bundle);
+        assert_eq!(
+            input.files().collect::<Vec<_>>(),
+            vec![("src/main.rs", bundle.as_slice())]
+        );
+        let verified_bundle = bundle.clone();
         bundle[0] ^= 1;
         assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
         bundle.pop();
         assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
-        bundle = input.bytes().to_vec();
+        bundle = verified_bundle;
         manifest.push(b' ');
         assert!(VerifiedInput::verify(&spec, &manifest, bundle.clone()).is_err());
         let invalid_manifest = br#"{"schema_version":1,"schema_version":1}"#;
         spec.input_manifest_sha256 = format!("{:x}", Sha256::digest(invalid_manifest));
         assert!(VerifiedInput::verify(&spec, invalid_manifest, bundle).is_err());
+    }
+
+    #[test]
+    fn inventory_refuses_unsafe_paths_collisions_and_unclaimed_bytes() {
+        let inventory = |paths: &[&str]| {
+            paths
+                .iter()
+                .map(|path| InputFile {
+                    path: (*path).into(),
+                    bytes: 1,
+                })
+                .collect()
+        };
+        for paths in [
+            vec!["../main.rs"],
+            vec!["/main.rs"],
+            vec!["src\\main.rs"],
+            vec!["C:main.rs"],
+            vec![".git/config"],
+            vec!["dir/NUL.txt"],
+            vec!["main.rs."],
+            vec!["src//main.rs"],
+            vec!["src", "src/main.rs"],
+            vec!["src/main.rs", "src"],
+            vec!["src/main.rs", "src/Main.rs"],
+            vec!["src/main.rs", "Src/lib.rs"],
+            vec!["src/main.rs", "src/main.rs"],
+        ] {
+            assert!(
+                file_ranges(inventory(&paths), paths.len()).is_err(),
+                "{paths:?}"
+            );
+        }
+        assert!(file_ranges(inventory(&["src/main.rs"]), 2).is_err());
+        assert!(file_ranges(inventory(&["src/main.rs"]), 0).is_err());
+        assert_eq!(
+            file_ranges(inventory(&["src/main.rs", "src/lib.rs"]), 2).unwrap(),
+            [("src/main.rs".into(), 0..1), ("src/lib.rs".into(), 1..2)]
+        );
     }
 
     #[test]
