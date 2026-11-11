@@ -94,6 +94,7 @@ name = "af-exec"
 version = "0.1.0"
 dependencies = [
  "af-entropy",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

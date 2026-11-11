@@ -6,6 +6,7 @@ license.workspace = true
 description = "Durable job runner with unknown-outcome reconciliation latch (jobs/worker M4 slice)"
 
 [dependencies]
+ring = "0.17"
 serde_json.workspace = true
 thiserror.workspace = true
 af-entropy.workspace = true

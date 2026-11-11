@@ -22,6 +22,7 @@ pub mod git;
 mod process;
 pub mod queue;
 pub mod worker;
+pub mod worker_auth;
 
 pub const STATUS_SCHEMA_VERSION: i64 = 1;
 
