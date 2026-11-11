@@ -318,6 +318,77 @@ mod tests {
         }
     }
     #[test]
+    fn enrichment_unknown_latches_hold_that_blocks_the_next_send() {
+        // ADR-0002 D1/D6: an enrichment send whose outcome is unknown latches
+        // the same durable hold as any other send — the very next paid call
+        // (the main loop's) is refused before any bytes go out.
+        let path = ledger();
+        let backend = AccountedBackend {
+            backend: Box::new(af_llm::ScriptedBackend::new(
+                "provider",
+                vec![
+                    BackendOutcome::Unknown {
+                        sent: true,
+                        detail: "transport died".into(),
+                    },
+                    BackendOutcome::Completed(af_llm::ChatResult {
+                        content: "would have been the main send".into(),
+                        usage: af_llm::Usage {
+                            tokens_in: Some(1),
+                            tokens_out: Some(1),
+                            cost_usd: Some(0.001),
+                            latency_ms: Some(1),
+                        },
+                        truncated: false,
+                        tool_calls: vec![],
+                    }),
+                ],
+            )),
+            ledger: path.clone(),
+            amount: af_budget::Money(10_000_000),
+            model: "model".into(),
+        };
+        let mut enrich =
+            ChatRequest::new("model", vec![af_llm::ChatMessage::new("user", "enrich")]);
+        enrich.max_output_tokens = Some(8);
+        enrich.host_attempt = Some(af_llm::HostAttempt {
+            session_id: "session1".into(),
+            call_id: "enrich1".into(),
+        });
+        let first = backend.chat(&enrich, &Cancel::new());
+        assert!(
+            matches!(first, BackendOutcome::Unknown { sent: true, .. }),
+            "the scripted provider death must surface as an unknown send"
+        );
+        let snapshot = af_budget::Ledger::open(&path, OWNER)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(
+            snapshot.has_hold(),
+            "an unknown enrichment send must latch the durable hold"
+        );
+        let mut main_send =
+            ChatRequest::new("model", vec![af_llm::ChatMessage::new("user", "main")]);
+        main_send.max_output_tokens = Some(8);
+        main_send.host_attempt = Some(af_llm::HostAttempt {
+            session_id: "session1".into(),
+            call_id: "main1".into(),
+        });
+        let second = backend.chat(&main_send, &Cancel::new());
+        match second {
+            BackendOutcome::Refused {
+                sent: false,
+                reason,
+            } => assert!(
+                reason.contains("budget"),
+                "the refusal must name the budget, got: {reason}"
+            ),
+            other => panic!("expected pre-send budget refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn provider_send_is_durably_settled_and_missing_cost_latches_hold() {
         for cost in [Some(0.001), None] {
             let path = ledger();

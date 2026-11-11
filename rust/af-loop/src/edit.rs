@@ -513,13 +513,22 @@ fn run_edit_task_journey(
                     enrichment_prefix = format!("Context enrichment (tour):\n{}\n\n", answer.text);
                 }
             } else {
-                let request = af_llm::ChatRequest::new(
+                // The enrichment send is a paid, accounted call like any
+                // other (D1): it carries a host attempt binding minted here,
+                // and the same id becomes the record's call_ref.
+                let call_id = format!("enrich-{}", af_entropy::token());
+                let mut request = af_llm::ChatRequest::new(
                     model,
                     vec![ChatMessage::new(
                         "user",
                         &crate::enrich::enrichment_prompt(task, &plan.target),
                     )],
                 );
+                request.max_output_tokens = Some(1024);
+                request.host_attempt = Some(af_llm::HostAttempt {
+                    session_id: plan.session_id.clone(),
+                    call_id: call_id.clone(),
+                });
                 let (outcome, note) = match router.route(&request, &Cancel::new()) {
                     af_llm::RouteOutcome::Completed { result, .. } => (
                         crate::enrich::parse_enrichment_response(&result.content),
@@ -539,8 +548,10 @@ fn run_edit_task_journey(
                     ),
                 };
                 if outcome.is_cache_worthy() {
+                    let mut record = crate::enrich::EnrichmentRecord::mint(key, outcome.clone());
+                    record.call_ref = Some(call_id);
                     cache
-                        .insert(crate::enrich::EnrichmentRecord::mint(key, outcome.clone()))
+                        .insert(record)
                         .map_err(|error| format!("enrichment cache write failed: {error}"))?;
                 }
                 journal
@@ -1188,6 +1199,7 @@ mod tests {
             target: vec![],
             model: "m".to_string(),
             prompt_schema: 1,
+            session_id: "session-test".to_string(),
             cache_path,
         }
     }

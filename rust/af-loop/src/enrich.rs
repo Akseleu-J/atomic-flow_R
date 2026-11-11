@@ -269,6 +269,10 @@ pub struct EnrichmentPlan {
     pub target: Vec<String>,
     pub model: String,
     pub prompt_schema: u32,
+    /// Session binding for the accounted send (HostAttempt.session_id); the
+    /// call id itself is minted here as `enrich-<token>` and becomes the
+    /// record's call_ref.
+    pub session_id: String,
     /// Append-only cache file for this root (revision-bound entries).
     pub cache_path: PathBuf,
 }

@@ -819,17 +819,51 @@ fn task_run(
             revision: "staged".into(),
         },
     };
-    let outcome = af_loop::edit::run_edit_task(
-        &router,
-        &toolset,
-        Some(&mut journal),
-        &model,
-        &goal,
-        true,
-        af_loop::LoopLimits::default(),
-        None,
-        Some(&mut requirement),
-    )?;
+    // N05 (ADR-0002): a live provider gets a host-built enrichment plan; the
+    // scripted path keeps the explicit Unavailable record only. The revision
+    // binds the cache to the target file's current bytes (D3).
+    let enrichment = if provider_id.as_deref().is_some_and(|id| id != "scripted") {
+        let target_path = root_path.join(&file);
+        let bytes = std::fs::read(&target_path).unwrap_or_default();
+        let cache_dir = af_sandbox::user_dir().join("enrichment");
+        std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+        Some(af_loop::enrich::EnrichmentPlan {
+            root_id: root_id.clone(),
+            revision: af_sandbox::sha256_hex(&bytes),
+            target: vec![file.clone()],
+            model: model.clone(),
+            prompt_schema: 1,
+            session_id: session_id.clone(),
+            cache_path: cache_dir.join(format!("{root_id}.jsonl")),
+        })
+    } else {
+        None
+    };
+    let outcome = match &enrichment {
+        Some(plan) => af_loop::edit::run_edit_task_with_enrichment(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            &model,
+            &goal,
+            true,
+            af_loop::LoopLimits::default(),
+            None,
+            Some(&mut requirement),
+            plan,
+        )?,
+        None => af_loop::edit::run_edit_task(
+            &router,
+            &toolset,
+            Some(&mut journal),
+            &model,
+            &goal,
+            true,
+            af_loop::LoopLimits::default(),
+            None,
+            Some(&mut requirement),
+        )?,
+    };
 
     let (state, summary) = match &outcome {
         af_loop::edit::EditOutcome::Completed {
