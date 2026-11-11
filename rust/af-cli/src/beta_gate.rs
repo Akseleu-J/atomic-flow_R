@@ -120,7 +120,7 @@ pub fn check(config: &GateConfig, now: u64) -> Result<GateOutcome, String> {
             // The decision parsed and verified: the pass is real but spent.
             // Recompute the honest human message from its bounds.
             let spent_hours = decision_provenance(&body)
-                .map(|(activated, expires)| (now.saturating_sub(activated)) / 3600)
+                .map(|(activated, _expires)| (now.saturating_sub(activated)) / 3600)
                 .unwrap_or(0);
             Ok(GateOutcome::Refused(format!(
                 "beta access is inactive or expired (about {spent_hours}h used of the 96h window); export your evidence with `af evidence export` and report back"

@@ -7,6 +7,7 @@ mod behavioral_checker;
 mod beta_gate;
 mod dashboard;
 mod doctor;
+mod evidence_export;
 mod server;
 mod trusted_provider;
 
@@ -46,8 +47,12 @@ enum Command {
     },
     /// MCP stdio server: line-delimited JSON-RPC over stdin/stdout.
     Mcp,
-    /// Environment checks for the self-host kernel (read-only).
-    Doctor,
+    /// Environment checks for the self-host kernel: human report by default,
+    /// --json for evidence bundles.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Beta access status: online verification of the 96h pass (B1).
     Beta,
     /// Structural graph operations (roadmap P01/P02 core).
@@ -86,6 +91,16 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Cleaned feedback package: event skeletons + doctor + version (B5).
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+    /// Durable budget ledger for live sends: create, inspect, hold state.
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommand,
+    },
     /// In-process vertical journey: build → delta → parity on a scratch root.
     SelfTest,
 }
@@ -94,13 +109,16 @@ enum Command {
 enum TaskCommand {
     /// Run one native task through the durable queue and the requirement gate.
     Run {
+        /// Registered workspace root id (the project graph to run in).
         #[arg(long)]
         root_id: String,
+        /// Workspace-relative path of the file the reviewed replacement targets.
         #[arg(long)]
         file: String,
         /// Exact reviewed replacement text (the reviewed plan; never model output).
         #[arg(long)]
         replacement: String,
+        /// The task description handed to the model.
         #[arg(long, default_value = "native task journey")]
         goal: String,
         /// Model backend: provider id registered in trusted host config, or
@@ -120,6 +138,10 @@ enum TaskCommand {
         check_argv: Option<String>,
         #[arg(long)]
         junit: Option<PathBuf>,
+        /// Live-send reservation ceiling in USD (e.g. 1.00); the ledger must
+        /// exist (af budget create) and admission refuses above it.
+        #[arg(long)]
+        budget_cap_usd: Option<String>,
     },
 }
 
@@ -383,9 +405,79 @@ fn run(command: Command) -> Result<String, String> {
     match command {
         Command::Serve { .. } => unreachable!("serve is handled in main"),
         Command::Mcp => unreachable!("mcp is handled in main"),
-        Command::Doctor => {
-            Ok(serde_json::to_string_pretty(&doctor::run_checks()).map_err(|e| e.to_string())?)
+        Command::Doctor { json } => {
+            let checks = doctor::run_checks();
+            if json {
+                Ok(serde_json::to_string_pretty(&checks).map_err(|e| e.to_string())?)
+            } else {
+                let mut text = String::from("af doctor: kernel environment checks\n");
+                for entry in checks["checks"].as_array().cloned().unwrap_or_default() {
+                    let name = entry["name"].as_str().unwrap_or("?");
+                    let ok = entry["ok"].as_bool().unwrap_or(false);
+                    let mark = if ok { "PASS" } else { "FAIL" };
+                    let detail = entry["detail"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry["detail"].to_string());
+                    text.push_str(&format!("{mark}  {name}: {detail}\n"));
+                    if !ok {
+                        if let Some(hint) = doctor_hint(name) {
+                            text.push_str(&format!("      hint: {hint}\n"));
+                        }
+                    }
+                }
+                Ok(text)
+            }
         }
+        Command::Evidence { command } => match command {
+            EvidenceCommand::Export {
+                session,
+                out,
+                include_payloads,
+            } => evidence_export::export(session.as_deref(), out, include_payloads)
+                .map(|summary| summary.to_string()),
+        },
+        Command::Budget { command } => match command {
+            BudgetCommand::Create { cap_usd, max_calls } => {
+                let path = trusted_provider::ledger_path();
+                if path.exists() {
+                    return Err(
+                        "budget ledger already exists; inspect it with `af budget show`".into(),
+                    );
+                }
+                let cap = af_budget::Money::from_usd_str(&cap_usd)
+                    .map_err(|_| "invalid --cap-usd".to_string())?;
+                if cap.0 == 0 {
+                    return Err("cap must be positive".into());
+                }
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                af_budget::Ledger::create(&path, trusted_provider::OWNER, cap, max_calls)
+                    .map_err(|e| e.0)?;
+                Ok(format!(
+                    "budget created: cap {cap_usd} USD, max {max_calls} calls, ledger {}",
+                    path.display()
+                ))
+            }
+            BudgetCommand::Show => {
+                let path = trusted_provider::ledger_path();
+                let state = af_budget::Ledger::open(&path, trusted_provider::OWNER)
+                    .map_err(|e| e.0)?
+                    .snapshot()
+                    .map_err(|e| e.0)?;
+                let available = state.available().map_err(|e| e.0)?;
+                Ok(json!({
+                    "cap": state.cap.usd_string(),
+                    "committed": state.committed().map(|m| m.usd_string()).unwrap_or_else(|_| "unresolved".into()),
+                    "available": available.map(|m| m.usd_string()).unwrap_or_else(|| "hold".into()),
+                    "has_hold": state.has_hold(),
+                    "calls": state.calls.len(),
+                    "ledger": path.display().to_string(),
+                })
+                .to_string())
+            }
+        },
         Command::Beta => {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -429,6 +521,7 @@ fn run(command: Command) -> Result<String, String> {
                 model,
                 check_argv,
                 junit,
+                budget_cap_usd,
             } => task_run(
                 root_id,
                 file,
@@ -440,6 +533,7 @@ fn run(command: Command) -> Result<String, String> {
                 model,
                 check_argv,
                 junit,
+                budget_cap_usd,
             ),
         },
         Command::Graph { command } => match command {
@@ -745,6 +839,48 @@ fn agent_journey(
 /// the outcome. Without an admitted behavioral checker the gate refuses by
 /// contract, so the task ends Unverified and the queue records exactly that.
 #[allow(clippy::too_many_arguments)]
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// Write one cleaned evidence package (payloads excluded by default).
+    Export {
+        /// Session id; omitted means the most recent session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Output path; default af-evidence-<session>.json.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Include journal payloads (prompts, snippets) for deep debugging.
+        #[arg(long)]
+        include_payloads: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BudgetCommand {
+    /// Create the durable budget ledger (refuses to overwrite).
+    Create {
+        /// Cap in USD, e.g. 1.00.
+        #[arg(long)]
+        cap_usd: String,
+        /// Maximum number of accounted calls.
+        #[arg(long, default_value_t = 64)]
+        max_calls: usize,
+    },
+    /// Show the ledger state: cap, committed, available, holds.
+    Show,
+}
+
+fn doctor_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "git" => Some("install Git for Windows or add git to PATH"),
+        "docker" => Some(
+            "install Docker Desktop for isolated test runs; the local-trusted fallback applies",
+        ),
+        "atomic_flow_home" => Some("check folder permissions or the ATOMIC_FLOW_HOME variable"),
+        _ => None,
+    }
+}
+
 fn task_run(
     root_id: String,
     file: String,
@@ -756,6 +892,7 @@ fn task_run(
     model: String,
     check_argv: Option<String>,
     junit: Option<PathBuf>,
+    budget_cap_usd: Option<String>,
 ) -> Result<String, String> {
     // B1: a new product operation re-checks beta access online when the
     // official build pins an issuer key (dev builds pass through ungated).
@@ -765,12 +902,19 @@ fn task_run(
         .unwrap_or(0);
     beta_gate::gate_new_operation(now_secs)?;
     let registry = af_sandbox::SandboxRegistry::new("default").map_err(|e| e.0)?;
+    let reservation_ceiling = budget_cap_usd
+        .as_deref()
+        .map(|value| {
+            af_budget::Money::from_usd_str(value)
+                .map_err(|_| "invalid --budget-cap-usd".to_string())
+        })
+        .transpose()?;
     let backend = crate::trusted_provider::select(
         provider_id.as_deref(),
         &base_url,
         &api_key_env,
         &model,
-        None,
+        reservation_ceiling,
     )?;
     let router = af_llm::Router::new(vec![backend]);
 
