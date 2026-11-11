@@ -4,6 +4,7 @@
 //! the explicit `--host-approved` flag: the human running the CLI is the host.
 
 mod behavioral_checker;
+mod beta_gate;
 mod dashboard;
 mod doctor;
 mod server;
@@ -47,6 +48,8 @@ enum Command {
     Mcp,
     /// Environment checks for the self-host kernel (read-only).
     Doctor,
+    /// Beta access status: online verification of the 96h pass (B1).
+    Beta,
     /// Structural graph operations (roadmap P01/P02 core).
     Graph {
         #[command(subcommand)]
@@ -382,6 +385,27 @@ fn run(command: Command) -> Result<String, String> {
         Command::Mcp => unreachable!("mcp is handled in main"),
         Command::Doctor => {
             Ok(serde_json::to_string_pretty(&doctor::run_checks()).map_err(|e| e.to_string())?)
+        }
+        Command::Beta => {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match beta_gate::GateConfig::from_env() {
+                None => Ok("beta gate: disabled (dev build without a pinned issuer key)".into()),
+                Some(config) => match beta_gate::check(&config, now_secs) {
+                    Ok(beta_gate::GateOutcome::Active { expires_in_secs }) => Ok(format!(
+                        "beta access: ACTIVE, {}h {}m remaining (grant {})",
+                        expires_in_secs / 3600,
+                        (expires_in_secs % 3600) / 60,
+                        config.grant_id
+                    )),
+                    Ok(beta_gate::GateOutcome::Refused(message)) => {
+                        Ok(format!("beta access: REFUSED - {message}"))
+                    }
+                    Err(error) => Ok(format!("beta access: UNAVAILABLE - {error}")),
+                },
+            }
         }
         Command::SelfTest => self_test(),
         Command::Agent { command } => match command {
@@ -733,6 +757,13 @@ fn task_run(
     check_argv: Option<String>,
     junit: Option<PathBuf>,
 ) -> Result<String, String> {
+    // B1: a new product operation re-checks beta access online when the
+    // official build pins an issuer key (dev builds pass through ungated).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    beta_gate::gate_new_operation(now_secs)?;
     let registry = af_sandbox::SandboxRegistry::new("default").map_err(|e| e.0)?;
     let backend = crate::trusted_provider::select(
         provider_id.as_deref(),

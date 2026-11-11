@@ -58,12 +58,14 @@ dependencies = [
  "clap",
  "http-body-util",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
  "tower",
+ "ureq",
 ]
 
 [[package]]

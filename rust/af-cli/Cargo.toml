@@ -35,6 +35,10 @@ serde = { version = "1", features = ["derive"] }
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
 
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
 [dev-dependencies]
+ring = "0.17"
+
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
