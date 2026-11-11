@@ -149,4 +149,71 @@ mod tests {
         body["expires_at"] = json!(101 + MAX_BETA_SECONDS);
         assert_eq!(call(&bytes(&body), 110).unwrap_err(), AccessError::Invalid);
     }
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        (0..value.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn frozen_issuance_vector_verifies_cross_language() {
+        // The issuance service (tools/issuance_server.py, openssl-backed)
+        // produced this vector: the domain-separated decision bytes it signs
+        // must satisfy the ring verifier byte-for-byte, and any tampering
+        // with the body must invalidate it (B1 cross-language contract).
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/beta-access-v1.json")).unwrap();
+        let seed: [u8; 32] = hex_bytes(vector["seed_hex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let signature: [u8; 64] = hex_bytes(vector["signature_hex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let body = vector["body"].as_str().unwrap().as_bytes().to_vec();
+        let expected = &vector["expected"];
+        let challenge: [u8; 32] = hex_bytes(expected["challenge"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        // Decisive experiment: does ring, from the same seed, produce the
+        // same deterministic ed25519 signature as openssl did?
+        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let ring_sig = pair.sign(&[SIGNING_DOMAIN, body.as_slice()].concat());
+        // Cross-implementation determinism: ring, from the same seed, must
+        // reproduce byte-for-byte the signature the openssl issuer minted.
+        assert_eq!(ring_sig.as_ref(), signature.as_slice());
+        // The verifier pins the ISSUER PUBLIC KEY (never the seed) —
+        // exactly what the official beta build embeds.
+        let issuer_key: [u8; 32] = hex_bytes(vector["pub_hex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let decision = verify_access(
+            &issuer_key,
+            &body,
+            &signature,
+            expected["grant_id"].as_str().unwrap(),
+            expected["release_id"].as_str().unwrap(),
+            Challenge(challenge),
+            expected["now"].as_u64().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decision.expires_at(), 100 + MAX_BETA_SECONDS - 1);
+        let mut tampered = body.clone();
+        let pos = body
+            .windows(6)
+            .position(|window| window == b"active")
+            .unwrap();
+        tampered[pos] ^= 1;
+        assert!(verify_access(
+            &issuer_key,
+            &tampered,
+            &signature,
+            expected["grant_id"].as_str().unwrap(),
+            expected["release_id"].as_str().unwrap(),
+            Challenge(challenge),
+            expected["now"].as_u64().unwrap(),
+        )
+        .is_err());
+    }
 }

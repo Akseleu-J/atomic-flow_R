@@ -1,0 +1,12 @@
+{
+ "seed_hex": "69056e8934d52091fced5fe9a961d03029aaa4a608b0f62ffbc128d80e00a29c",
+ "pub_hex": "caa648c41c0fcb0c09b75eada8868e96b9ba7014bcfe900908b178bb427832d9",
+ "body": "{\"schema_version\":1,\"grant_id\":\"engineer-1\",\"release_id\":\"beta-rc1\",\"challenge\":\"abababababababababababababababababababababababababababababababab\",\"active\":true,\"activated_at\":100,\"checked_at\":110,\"expires_at\":345699}",
+ "signature_hex": "a51ababde45018cbffc1e4543162932a31950ab6365eab51eec145abfea0f9a47a9b8ee172492980c3cd2266856b5761bc8ab4699487a7bc98814ef0f6a19f08",
+ "expected": {
+  "grant_id": "engineer-1",
+  "release_id": "beta-rc1",
+  "challenge": "abababababababababababababababababababababababababababababababab",
+  "now": 110
+ }
+}
