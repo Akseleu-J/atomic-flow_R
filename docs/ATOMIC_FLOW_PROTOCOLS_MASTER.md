@@ -11,7 +11,8 @@ Vault-файл: `C:\Users\omirb\OneDrive\Документы\ChatGPT\computer_con
 ## 1. Копии проекта и репозитории
 | Копия | Путь | Роль | Ремоуты |
 |---|---|---|---|
-| **dev-копия** (активная, Rust-линия) | `C:\Users\omirb\.zcode\workspace\7a9e7cc1-327f-4133-a7af-0ccfe5ee24e8\atomic-flow-dev` | вся Rust-разработка | `r` = github.com/Akseleu-J/atomic-flow_R (PUBLIC, main=experimental), `github` = .../atomic-flow.git, `origin` = OneDrive-копия |
+| **dev-копия** (активная, Rust-линия; **ПЕРЕЕХАЛА на D: 11.11** — не заполнять C:) | `D:\atomic-flow-dev` | вся Rust-разработка; codex-сессия временно живёт в старом C:-дереве (`...\.zcode\workspace\7a9e7cc1-...\atomic-flow-dev`, его target удалён) — его локальные коммиты подтягивать на D: перед работой (`git fetch dev-c`) | `r` = github.com/Akseleu-J/atomic-flow_R (PUBLIC, main=experimental), `github` = .../atomic-flow.git, `origin` = OneDrive-копия, `dev-c` = старое C:-дерево (только чтение) |
+| **af-kaggle** (Kaggle-скрипты полного цикла) | `D:\af-kaggle` | prepare/poll/fetch kernel-цикл | — |
 | **OneDrive-копия** (эталон Python-линии) | `C:\Users\omirb\OneDrive\Документы\ChatGPT\atomic-flow 2\atomic-flow` | Python-платформа, codex-сессия работает ЗДЕСЬ | `github` (public python-репо), своя история |
 | **Kaggle-копия** | датасеты `umirbayulgaisha/af-native-src-1106` и kernel-артефакты | Linux-прогоны | — |
 
