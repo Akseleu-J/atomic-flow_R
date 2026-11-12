@@ -32,10 +32,12 @@ serde = { version = "1", features = ["derive"] }
 
 # Native folder picker is a Windows-host capability; on headless Linux the
 # endpoint refuses honestly instead of dragging GTK/Wayland system deps in.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+# Native folder picker is a Windows-host capability; on headless Linux the
+# endpoint refuses honestly instead of dragging GTK/Wayland system deps in.
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"
-
-ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 ring = "0.17"
