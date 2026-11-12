@@ -393,8 +393,6 @@ fn hold_stale_requirement(
 /// to this task (sandbox apply authority), never inferred from model text.
 /// `git` is retained for compatibility. Without a bound completed requirement
 /// checker this path never auto-commits, even when a diagnostic exits zero.
-// Preserve the existing API with explicit host authority and requirement-checker inputs.
-#[allow(clippy::too_many_arguments)]
 /// Run the guided edit journey on the deterministic path: no enrichment plan
 /// is supplied, so an explicit Unavailable enrichment record is journaled
 /// (ADR-0002 D2/D4) and no cache entry is minted.
@@ -1261,7 +1259,7 @@ mod tests {
         assert_eq!(enrichments[0]["payload"]["outcome"], json!("answer"));
         assert_eq!(enrichments[0]["payload"]["cached"], json!(false));
         assert_eq!(enrichments[0]["payload"]["completeness"], json!("full"));
-        let (cache, stats) = crate::enrich::EnrichmentCache::open(&cache_path);
+        let (_, stats) = crate::enrich::EnrichmentCache::open(&cache_path);
         assert_eq!(stats.records, 1, "answer must be cached");
 
         // Second journey on the same revision: the cached answer is served

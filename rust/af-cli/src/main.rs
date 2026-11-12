@@ -881,6 +881,7 @@ fn doctor_hint(name: &str) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn task_run(
     root_id: String,
     file: String,
@@ -923,8 +924,7 @@ fn task_run(
     let payload_digest = af_sandbox::sha256_hex(replacement.as_bytes());
     let entry_id = format!(
         "task-{}",
-        af_sandbox::sha256_hex(format!("{root_id}\n{file}\n{replacement}").as_bytes(),)[..16]
-            .to_string()
+        &af_sandbox::sha256_hex(format!("{root_id}\n{file}\n{replacement}").as_bytes(),)[..16]
     );
     let queue_path = af_sandbox::user_dir().join("tasks");
     std::fs::create_dir_all(&queue_path).map_err(|e| e.to_string())?;

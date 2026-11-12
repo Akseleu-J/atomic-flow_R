@@ -126,6 +126,7 @@ impl af_evidence::HostRequirementChecker for CommandBehavioralChecker {
 mod tests {
     use super::*;
     use af_evidence::HostRequirementChecker;
+    use std::path::Path;
 
     fn workspace(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -137,7 +138,7 @@ mod tests {
         dir
     }
 
-    fn checker_for(dir: &PathBuf, argv: Vec<String>) -> CommandBehavioralChecker {
+    fn checker_for(dir: &Path, argv: Vec<String>) -> CommandBehavioralChecker {
         // The job store lives OUTSIDE the audited source directory: runner
         // bookkeeping must never look like source mutation.
         let jobs = dir
@@ -148,7 +149,7 @@ mod tests {
             checker_id: "host-tests".into(),
             runner: af_exec::JobRunner::open(&jobs).unwrap(),
             argv,
-            cwd: dir.clone(),
+            cwd: dir.to_path_buf(),
             junit_path: dir.join("report.xml"),
         }
     }

@@ -41,10 +41,6 @@ impl GateConfig {
             service_url: std::env::var("AF_BETA_SERVICE").ok()?,
         })
     }
-
-    pub fn active(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,9 +348,8 @@ mod tests {
             ..config
         };
         let late = 100 + 96 * 3600 + 60;
-        match check(&config2, late) {
-            Ok(GateOutcome::Active { .. }) => panic!("ancient decision must not grant access"),
-            _ => {}
+        if let Ok(GateOutcome::Active { .. }) = check(&config2, late) {
+            panic!("ancient decision must not grant access");
         }
         server2.join().unwrap();
     }
