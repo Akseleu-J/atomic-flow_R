@@ -6,7 +6,7 @@ import { AfClient, AfHttpError, AfProtocolError, AfTransportError, WireError, pa
 const vectors = JSON.parse(await readFile(new URL('../../../rust/af-evidence/fixtures/wire-v1.json', import.meta.url), 'utf8'));
 const baseline = JSON.parse(vectors.cases.find(c => c.name === 'empty_not_assessed').json);
 const health = { ok: true, version: '0.1.0', kernel: 'atomic-flow-rust' };
-const capabilities = { schema_version: 1, verification_schema_version: 1, authority: 'single_owner', requirement_checker: 'unavailable', verification_report_authorizes_execution: false, publication_recovery: 'host_cli_preview_digest', unknown_replay: false };
+const capabilities = { schema_version: 1, verification_schema_version: 2, authority: 'single_owner', requirement_checker: 'unavailable', verification_report_authorizes_execution: false, publication_recovery: 'host_cli_preview_digest', unknown_replay: false };
 const json = value => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 const client = fetchImpl => new AfClient({ baseUrl: 'http://127.0.0.1:8787', fetchImpl });
 const input = { backend: { provider_id: 'scripted', model: 'scripted' }, prompt: 'Explain\nthe code' };

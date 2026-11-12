@@ -70,7 +70,7 @@ def run():
             request("/health", authorized=False, expected=401)
             request("/v1/capabilities", authorized=False, expected=401)
             capabilities = json.loads(request("/v1/capabilities")[0])
-            assert capabilities["verification_schema_version"] == 1
+            assert capabilities["verification_schema_version"] == 2  # af-evidence v2 contract bump (ADR-0002 S3a)
             assert capabilities["requirement_checker"] == "unavailable"
             assert capabilities["verification_report_authorizes_execution"] is False
             html, headers = request("/dashboard", authorized=False)

@@ -12,7 +12,7 @@ export interface AfClientOptions { baseUrl: string; token?: string; fetchImpl?: 
 export interface SessionCreated { ok: true; session_id: string; path: string }
 /** Historical name kept: a validated session summary DTO. */
 export type SessionSnapshot = SessionSummaryDto;
-export interface Capabilities { schema_version: 1; verification_schema_version: 1; authority: "single_owner"; requirement_checker: "unavailable"; verification_report_authorizes_execution: false; publication_recovery: "host_cli_preview_digest"; unknown_replay: false }
+export interface Capabilities { schema_version: 1; verification_schema_version: 2; authority: "single_owner"; requirement_checker: "unavailable"; verification_report_authorizes_execution: false; publication_recovery: "host_cli_preview_digest"; unknown_replay: false }
 export interface BackendSelection { provider_id: string; model: string }
 export interface EditJourneyInput { backend: BackendSelection; root_id: string; file: string; replacement: string; goal: string; session_id?: string; host_approved: true }
 export interface JourneysReport { ok: boolean; verified: false; refusal: Record<string, unknown>; session_id: string; edits: number; verification: "not_assessed"; status: "changed_unverified" | "answered_unverified" | "paused" }
@@ -115,7 +115,7 @@ export class AfClient {
   async health(): Promise<HealthDto> { return validateHealth(await this.json("/health")); }
   async capabilities(): Promise<Capabilities> {
     const r = exact(await this.json("/v1/capabilities"), ["schema_version", "verification_schema_version", "authority", "requirement_checker", "verification_report_authorizes_execution", "publication_recovery", "unknown_replay"]);
-    return { schema_version: literal(r.schema_version, 1), verification_schema_version: literal(r.verification_schema_version, 1), authority: literal(r.authority, "single_owner"), requirement_checker: literal(r.requirement_checker, "unavailable"), verification_report_authorizes_execution: literal(r.verification_report_authorizes_execution, false), publication_recovery: literal(r.publication_recovery, "host_cli_preview_digest"), unknown_replay: literal(r.unknown_replay, false) };
+    return { schema_version: literal(r.schema_version, 1), verification_schema_version: literal(r.verification_schema_version, 2), authority: literal(r.authority, "single_owner"), requirement_checker: literal(r.requirement_checker, "unavailable"), verification_report_authorizes_execution: literal(r.verification_report_authorizes_execution, false), publication_recovery: literal(r.publication_recovery, "host_cli_preview_digest"), unknown_replay: literal(r.unknown_replay, false) };
   }
   async createSession(id?: string, rootId?: string): Promise<SessionCreated> {
     const body = { ...(id === undefined ? {} : { id: text(id) }), ...(rootId === undefined ? {} : { root_id: text(rootId) }) };
