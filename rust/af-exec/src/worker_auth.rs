@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 
 pub const AUTH_DOMAIN: &[u8] = b"atomic-flow/worker-auth/v1\0";
 pub const MAX_ENVELOPE_TTL_SECS: u64 = 30;
-const MAX_WIRE_BYTES: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
