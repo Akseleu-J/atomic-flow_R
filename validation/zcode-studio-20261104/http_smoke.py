@@ -105,7 +105,7 @@ def run():
             assert final["content"] == "scripted-echo" and final["verification"] == "not_assessed"
             assert final["sources"][0]["sha256"] == source["sha256"]
             report = final["verification_report"]
-            assert report["schema_version"] == 1 and report["requirements"]["checked"] == 0
+            assert report["schema_version"] == 2 and report["requirements"]["checked"] == 0
             assert report["requirements"]["status"] == "not_assessed"
             assert report["evidence_coverage"]["delivered_complete"] == 0
             assert final["coverage_scope"] == "selected_request_excerpts"
