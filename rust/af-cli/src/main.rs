@@ -5,6 +5,7 @@
 
 mod behavioral_checker;
 mod beta_gate;
+mod crash_log;
 mod dashboard;
 mod doctor;
 mod evidence_export;
@@ -326,6 +327,10 @@ enum BackendCommand {
 }
 
 fn main() {
+    // T1.9: local crash capture first — every later panic leaves a
+    // JSONL record the evidence export can pick up. Nothing is sent
+    // anywhere by itself.
+    crash_log::install_hook();
     let cli = Cli::parse();
     if let Command::Serve {
         bind,

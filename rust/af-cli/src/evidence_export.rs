@@ -63,6 +63,7 @@ pub fn export(
         "include_payloads": include_payloads,
         "events": events,
         "doctor": crate::doctor::run_checks(),
+        "crashes": crate::crash_log::load_summary(),
         "note": "payloads excluded by default; provider credentials never enter the journal",
     });
     let out_path = out.unwrap_or_else(|| PathBuf::from(format!("af-evidence-{session_id}.json")));
