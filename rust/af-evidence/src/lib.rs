@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const VERSION: u32 = 1;
+/// v2 (2026-11-12): adds the N05 `enrichment` summary field (ADR-0002 D5).
+/// v1 wire bytes are rejected on parse — the bump is part of the contract.
+pub const VERSION: u32 = 2;
 pub const MAX_WIRE_BYTES: usize = 262_144;
 pub const MAX_ITEMS: usize = 256;
 pub const MAX_COUNT: u64 = 1_000_000;
@@ -239,6 +241,61 @@ pub enum Publication {
     Failed,
     Unknown,
 }
+/// N05 (ADR-0002 D5): what the context-enrichment attempt produced, as data
+/// only. `af-loop` maps its richer types onto this vocabulary; the host
+/// validates bounds and the status/completeness coupling here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichmentStatus {
+    Answer,
+    NoAnswer,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrichmentSummary {
+    pub status: EnrichmentStatus,
+    /// Host vocabulary: "tour" | "impact".
+    pub kind: String,
+    pub cached: bool,
+    /// Ledger call reference of the minting send; null when no send happened.
+    pub call_ref: Option<String>,
+    /// "full" | "partial" | "none" - required for answers, null otherwise.
+    pub completeness: Option<String>,
+    pub coverage: Vec<String>,
+}
+impl EnrichmentSummary {
+    fn validate(&self) -> Result<()> {
+        require(
+            self.kind == "tour" || self.kind == "impact",
+            "enrichment kind",
+        )?;
+        require(
+            matches!(
+                (&self.status, self.completeness.as_deref()),
+                (EnrichmentStatus::Answer, Some("full" | "partial" | "none"))
+                    | (
+                        EnrichmentStatus::NoAnswer | EnrichmentStatus::Unavailable,
+                        None
+                    )
+            ),
+            "enrichment status/completeness coupling",
+        )?;
+        if let Some(id) = &self.call_ref {
+            require(text(id, 128), "enrichment call ref")?;
+        }
+        require(
+            self.coverage.len() <= MAX_ITEMS,
+            "enrichment coverage limit",
+        )?;
+        for entry in &self.coverage {
+            require(text(entry, 256), "enrichment coverage entry")?;
+        }
+        Ok(())
+    }
+}
+
 /// Public result DTO. Even a well-formed `passed` field is untrusted on input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,6 +305,7 @@ pub struct VerificationReport {
     pub identifier_hygiene: CheckSummary,
     pub citation_validity: CheckSummary,
     pub evidence_coverage: EvidenceCoverage,
+    pub enrichment: Option<EnrichmentSummary>,
     pub syntax: CheckSummary,
     pub tests: CheckSummary,
     pub requirements: CheckSummary,
@@ -270,6 +328,7 @@ impl VerificationReport {
                 delivered_partial: 0,
                 omissions: vec![],
             },
+            enrichment: None,
             syntax: CheckSummary::default(),
             tests: CheckSummary::default(),
             requirements: CheckSummary::default(),
@@ -293,6 +352,9 @@ impl VerificationReport {
             summary.validate()?;
         }
         self.evidence_coverage.validate()?;
+        if let Some(enrichment) = &self.enrichment {
+            enrichment.validate()?;
+        }
         require(
             self.citations.len() <= MAX_ITEMS && self.claims.len() <= MAX_ITEMS,
             "item limit",
