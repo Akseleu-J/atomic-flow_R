@@ -45,6 +45,10 @@ struct ServerState {
     port: u16,
     streams: Arc<tokio::sync::Semaphore>,
     edits: Arc<tokio::sync::Semaphore>,
+    // The rfd folder-picker admission lives behind cfg(windows); on
+    // headless Linux the endpoint refuses before ever touching this,
+    // so an unread field there is the honest state, not dead code.
+    #[cfg_attr(not(windows), allow(dead_code))]
     picker: Arc<tokio::sync::Semaphore>,
 }
 
