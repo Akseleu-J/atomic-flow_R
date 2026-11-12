@@ -296,6 +296,52 @@ impl EnrichmentSummary {
     }
 }
 
+/// Map one journaled `enrichment` event payload (the flat vocabulary
+/// af-loop writes: kind/target/outcome/reason/cached/completeness/coverage/
+/// call_ref) onto the report DTO. Returns None for anything that is not an
+/// enrichment payload — a missing summary must never be invented.
+impl EnrichmentSummary {
+    pub fn from_journal_payload(payload: &serde_json::Value) -> Option<Self> {
+        let outcome = payload.get("outcome")?.as_str()?;
+        let status = match outcome {
+            "answer" => EnrichmentStatus::Answer,
+            "no_answer" => EnrichmentStatus::NoAnswer,
+            "unavailable" => EnrichmentStatus::Unavailable,
+            _ => return None,
+        };
+        let kind = payload.get("kind")?.as_str()?.to_string();
+        let cached = payload.get("cached")?.as_bool()?;
+        let completeness = match payload.get("completeness") {
+            Some(v) if v.is_null() => None,
+            Some(v) => Some(v.as_str()?.to_string()),
+            None => None,
+        };
+        let call_ref = match payload.get("call_ref") {
+            Some(v) if v.is_null() => None,
+            Some(v) => Some(v.as_str()?.to_string()),
+            None => None,
+        };
+        let coverage = payload
+            .get("coverage")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(EnrichmentSummary {
+            status,
+            kind,
+            cached,
+            call_ref,
+            completeness,
+            coverage,
+        })
+    }
+}
+
 /// Public result DTO. Even a well-formed `passed` field is untrusted on input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -366,12 +366,14 @@ pub fn journal_payload(
     target: &[String],
     outcome: &EnrichmentOutcome,
     cached: bool,
+    call_ref: Option<&str>,
     note: Option<&str>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "kind": kind,
         "target": target,
         "cached": cached,
+        "call_ref": call_ref,
     });
     if let serde_json::Value::Object(fields) =
         serde_json::to_value(outcome).expect("outcome serializes")

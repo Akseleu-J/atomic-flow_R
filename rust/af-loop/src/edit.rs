@@ -500,6 +500,7 @@ fn run_edit_task_journey(
                             &plan.target,
                             &record.outcome,
                             true,
+                            record.call_ref.as_deref(),
                             None,
                         ),
                         None,
@@ -547,7 +548,7 @@ fn run_edit_task_journey(
                 };
                 if outcome.is_cache_worthy() {
                     let mut record = crate::enrich::EnrichmentRecord::mint(key, outcome.clone());
-                    record.call_ref = Some(call_id);
+                    record.call_ref = Some(call_id.clone());
                     cache
                         .insert(record)
                         .map_err(|error| format!("enrichment cache write failed: {error}"))?;
@@ -560,6 +561,7 @@ fn run_edit_task_journey(
                             &plan.target,
                             &outcome,
                             false,
+                            Some(call_id.as_str()),
                             note.as_deref(),
                         ),
                         None,
@@ -583,6 +585,7 @@ fn run_edit_task_journey(
                             reason: crate::enrich::UnavailableReason::Disabled,
                         },
                         false,
+                        None,
                         Some("live enrichment wiring lands in slice S2b (ADR-0002)"),
                     ),
                     // No call_id and no top-level outcome: enrichment is not a

@@ -1113,11 +1113,23 @@ fn task_run(
         .get(&entry_id)
         .map(|entry| json!({"entry_id": entry.entry_id, "state": entry.state.as_str()}))
         .unwrap_or(Value::Null);
+    // N05 (ADR-0002 D5): the task result carries the enrichment summary
+    // mapped from the journey's journaled enrichment events, if any.
+    let enrichment_summary = journal.read().ok().and_then(|snapshot| {
+        snapshot
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["event_type"] == json!("enrichment"))
+            .and_then(|event| event.get("payload"))
+            .and_then(af_evidence::EnrichmentSummary::from_journal_payload)
+    });
     let value = json!({
         "ok": state == "completed",
         "state": state,
         "entry": entry,
         "summary": summary,
+        "enrichment": enrichment_summary,
         "session_id": journal.session_id,
     });
     if state == "completed" {

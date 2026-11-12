@@ -149,18 +149,18 @@ fn malformed_wire_rejected_directly_not_via_value() {
     let json = report_json(&report()).unwrap();
     for bad in [
         json.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
             1,
         ),
-        json.replacen("\"schema_version\":1", "\"schema_version\":true", 1),
+        json.replacen("\"schema_version\":2", "\"schema_version\":true", 1),
         json.replacen("\"checked\":0", "\"checked\":NaN", 1),
         json.replacen("\"checked\":0", "\"checked\":1.0", 1),
         json.replacen("\"checked\":0", "\"checked\":18446744073709551616", 1),
-        json.replacen("\"schema_version\":1", "\"schema_version\":2", 1),
+        json.replacen("\"schema_version\":2", "\"schema_version\":3", 1),
         json.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"approved\":true",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"approved\":true",
             1,
         ),
         format!("{json}x"),
@@ -252,7 +252,7 @@ fn receipts_are_current_requirement_runtime_and_inventory_bound() {
 }
 #[test]
 fn frozen_vectors_match_exporter_and_validator() {
-    let vectors = include_str!("../fixtures/wire-v1.json");
+    let vectors = include_str!("../fixtures/wire-v2.json");
     let vectors: serde_json::Value = serde_json::from_str(vectors).unwrap();
     for vector in vectors["cases"].as_array().unwrap() {
         assert_eq!(
@@ -380,4 +380,49 @@ fn confused_checker_scope_outputs_do_not_mint_receipts() {
     for changed in 0..5 {
         assert!(run_requirement_check(&scope(), &mut Confused(changed)).is_err());
     }
+}
+
+#[test]
+fn v1_wire_is_rejected_after_the_v2_bump() {
+    // The frozen v1 corpus predates the enrichment field; the schema gate
+    // must reject its raw bytes outright (ADR-0002 S3 contract bump).
+    let vectors = include_str!("../fixtures/wire-v1.json");
+    let vectors: serde_json::Value = serde_json::from_str(vectors).unwrap();
+    for vector in vectors["cases"].as_array().unwrap() {
+        // Only v1-VALID reports (schema 1) are contract-bound to the old
+        // version; v1-negative vectors (e.g. its future-version case) may
+        // legitimately parse under v2.
+        if vector["valid"].as_bool().unwrap() {
+            assert!(
+                parse_report(vector["json"].as_str().unwrap()).is_err(),
+                "{}",
+                vector["name"]
+            );
+        }
+    }
+}
+
+#[test]
+fn journal_payload_maps_onto_the_report_summary() {
+    use serde_json::json;
+    let answer = EnrichmentSummary::from_journal_payload(&json!({
+        "kind": "tour", "target": [], "outcome": "answer", "cached": false,
+        "call_ref": "enrich-abc", "completeness": "full", "coverage": ["src/lib.rs"]
+    }))
+    .unwrap();
+    assert_eq!(answer.status, EnrichmentStatus::Answer);
+    assert_eq!(answer.call_ref.as_deref(), Some("enrich-abc"));
+    assert_eq!(answer.completeness.as_deref(), Some("full"));
+    let unavailable = EnrichmentSummary::from_journal_payload(&json!({
+        "kind": "tour", "target": [], "outcome": "unavailable", "cached": false,
+        "call_ref": null, "reason": "disabled"
+    }))
+    .unwrap();
+    assert_eq!(unavailable.status, EnrichmentStatus::Unavailable);
+    assert!(unavailable.completeness.is_none());
+    // Not an enrichment payload: no summary is invented.
+    assert!(EnrichmentSummary::from_journal_payload(&json!({"text": "hi"})).is_none());
+    // Summary passes the report-level validation unchanged.
+    answer.validate().unwrap();
+    unavailable.validate().unwrap();
 }
