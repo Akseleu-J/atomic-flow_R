@@ -9,6 +9,7 @@ mod crash_log;
 mod dashboard;
 mod doctor;
 mod evidence_export;
+mod init_wizard;
 mod server;
 mod trusted_provider;
 
@@ -56,6 +57,12 @@ enum Command {
     },
     /// Beta access status: online verification of the 96h pass (B1).
     Beta,
+    /// First-run wizard: providers template, budget ledger, doctor verdict.
+    Init {
+        /// Seed the budget ledger with this cap when none exists (e.g. 1.00).
+        #[arg(long)]
+        budget_cap_usd: Option<String>,
+    },
     /// Structural graph operations (roadmap P01/P02 core).
     Graph {
         #[command(subcommand)]
@@ -503,6 +510,10 @@ fn run(command: Command) -> Result<String, String> {
                     Err(error) => Ok(format!("beta access: UNAVAILABLE - {error}")),
                 },
             }
+        }
+        Command::Init { budget_cap_usd } => {
+            let report = init_wizard::run(budget_cap_usd.as_deref())?;
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
         }
         Command::SelfTest => self_test(),
         Command::Agent { command } => match command {
