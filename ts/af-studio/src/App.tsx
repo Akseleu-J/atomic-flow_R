@@ -337,7 +337,7 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                 <select className="provider-select mono" value={selectedModel}
                   disabled={streaming || reviewBusy} aria-label="Модель"
                   onChange={event => setModel(event.target.value)}>
-                  {(providerList?.find(p => p.id === selectedProvider)?.models ?? ["scripted"]).map(model => (
+                  {(providerList?.find(p => p.id === selectedProvider)?.models ?? ["scripted" as string]).map((model: string) => (
                     <option key={model} value={model}>{model}</option>
                   ))}
                 </select>
