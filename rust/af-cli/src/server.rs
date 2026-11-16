@@ -847,6 +847,7 @@ fn spawn_chat_stream(
     model: String,
     prompt: String,
     sources: Vec<Value>,
+    history: Vec<af_llm::ChatMessage>,
     mut journal: Option<af_journal::SessionJournal>,
     call_id: String,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -893,13 +894,14 @@ fn spawn_chat_stream(
                 .map(|j| j.session_id.as_str())
                 .unwrap_or("unbound"),
         );
-        let mut request =
-            af_llm::ChatRequest::new(&model, vec![af_llm::ChatMessage::new("user", &prompt)]);
+        let mut messages = history;
+        messages.push(af_llm::ChatMessage::new("user", &prompt));
+        let mut request = af_llm::ChatRequest::new(&model, messages);
         request.host_attempt = journal.as_ref().map(|journal| af_llm::HostAttempt {
             session_id: journal.session_id.clone(),
             call_id: call_id.clone(),
         });
-        request.max_output_tokens = Some(256);
+        request.max_output_tokens = Some(2048);
         let mut bytes = 0usize;
         let mut overflow = false;
         let outcome = backend.chat_stream(&request, &worker_cancel, &mut |delta| {
@@ -1116,7 +1118,7 @@ async fn chat_stream_sse(
         .try_acquire_owned()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let call_id = af_entropy::token();
-    let journal = if let Some(session_id) = body.session_id {
+    let mut journal = if let Some(session_id) = body.session_id {
         let mut journal =
             af_journal::SessionJournal::open(&session_id).map_err(|_| StatusCode::NOT_FOUND)?;
         let previous = journal.read().map_err(|_| StatusCode::CONFLICT)?;
@@ -1137,11 +1139,50 @@ async fn chat_stream_sse(
     } else {
         None
     };
+    // Claude-code-level multi-turn: prior journaled turns of this session
+    // become the conversation history (bounded, oldest-first, current
+    // prompt last). The host owns the history; the browser never replays it.
+    let history = if let Some(journal) = journal.as_mut() {
+        let snapshot = journal.read().map_err(|_| StatusCode::CONFLICT)?;
+        let mut turns: Vec<af_llm::ChatMessage> = Vec::new();
+        for event in &snapshot.events {
+            let kind = event
+                .get("event_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if kind != "user_input" && kind != "model_response" {
+                continue;
+            }
+            let payload_field = if kind == "user_input" {
+                "text"
+            } else {
+                "content"
+            };
+            let text = event
+                .pointer(&format!("/payload/{payload_field}"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if text.is_empty() || text.len() > 8192 {
+                continue;
+            }
+            let role = if kind == "user_input" {
+                "user"
+            } else {
+                "assistant"
+            };
+            turns.push(af_llm::ChatMessage::new(role, text));
+        }
+        let bounded: Vec<_> = turns.chunks(8).last().unwrap_or(&[]).to_vec();
+        bounded
+    } else {
+        Vec::new()
+    };
     let (rx, cancel) = spawn_chat_stream(
         backend,
         body.backend.model,
         augmented_prompt,
         sources,
+        history,
         journal,
         call_id,
         permit,
@@ -1605,6 +1646,7 @@ mod tests {
             "scripted".into(),
             "test".into(),
             vec![],
+            Vec::new(),
             None,
             "bounded-output".into(),
             semaphore.clone().try_acquire_owned().unwrap(),
@@ -1658,6 +1700,7 @@ mod tests {
             "scripted".into(),
             "test".into(),
             vec![],
+            Vec::new(),
             None,
             "call-ok".into(),
             Arc::new(tokio::sync::Semaphore::new(1))
@@ -1683,6 +1726,7 @@ mod tests {
             "scripted".into(),
             "test".into(),
             vec![],
+            Vec::new(),
             None,
             "call-unknown".into(),
             Arc::new(tokio::sync::Semaphore::new(1))
@@ -1704,6 +1748,7 @@ mod tests {
             "scripted".into(),
             "test".into(),
             vec![],
+            Vec::new(),
             None,
             "call-over-cap".into(),
             Arc::new(tokio::sync::Semaphore::new(1))
@@ -1751,6 +1796,7 @@ mod tests {
             "scripted".into(),
             "test".into(),
             vec![],
+            Vec::new(),
             None,
             "cancel-test".into(),
             semaphore.clone().try_acquire_owned().unwrap(),

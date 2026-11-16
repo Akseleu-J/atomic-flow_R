@@ -306,3 +306,14 @@ summary.trow::before { content: "›"; color: var(--muted); width: 9px; display:
   background: var(--bg2); color: var(--text); border: 1px solid var(--border2);
   border-radius: 6px; padding: 6px; font: inherit;
 }
+
+/* cc-level additions */
+.md-p { margin: 0 0 .5em; }
+.md-code { background: var(--surface, #14161a); color: #d7dae0; padding: .6em .8em; border-radius: 6px; overflow-x: auto; margin: .4em 0 .7em; font-size: 12px; }
+.m-text code { background: rgba(255,255,255,.08); padding: .05em .35em; border-radius: 4px; }
+.m-meta { opacity: .55; font-size: 11px; margin-top: .25em; }
+.msg.system .sys-text { opacity: .6; font-size: 12px; }
+.session-select { margin-left: auto; max-width: 260px; background: var(--surface, #14161a); color: inherit; border: 1px solid rgba(255,255,255,.15); border-radius: 6px; padding: 2px 6px; font-size: 11px; }
+.provider-row { display: flex; gap: 8px; padding: 4px 12px 0; align-items: center; }
+.provider-select { background: var(--surface, #14161a); color: inherit; border: 1px solid rgba(255,255,255,.15); border-radius: 6px; padding: 3px 6px; font-size: 12px; max-width: 220px; }
+.provider-err { color: #e0a34a; font-size: 11px; }

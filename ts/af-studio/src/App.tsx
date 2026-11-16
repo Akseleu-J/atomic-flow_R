@@ -43,7 +43,40 @@ const PUBLICATION_LABEL: Record<VerificationReport["publication"], string> = {
   unknown: "публикация неизвестна",
 };
 
-interface DialogMessage { kind: "user" | "assistant" | "error"; text: string; report?: VerificationReport }
+interface DialogMessage { kind: "user" | "assistant" | "error" | "system"; text: string; report?: VerificationReport }
+interface ReplyMeta { tokens_in: number | null; tokens_out: number | null; cost_usd: number | null }
+
+/** Bounded markdown-lite: fenced code, inline code, bold, paragraphs.
+ *  No external parser — the studio stays dependency-bounded. */
+function renderMarkdown(text: string): ReactElement[] {
+  const blocks: ReactElement[] = [];
+  const parts = text.split(/```(?:[a-zA-Z0-9_+-]*)\n?/);
+  parts.forEach((part, index) => {
+    if (index % 2 === 1) {
+      blocks.push(<pre className="md-code mono" key={`c${index}`}>{part.replace(/\n$/, "")}</pre>);
+      return;
+    }
+    const paragraphs = part.split(/\n{2,}/).filter(p => p.trim() !== "");
+    paragraphs.forEach((paragraph, pIndex) => {
+      const key = `p${index}-${pIndex}`;
+      const lines = paragraph.split("\n").map((line, lIndex) => {
+        const pieces = line.split(/(\*\*[^*]+\*\*|`[^`]+`)/).filter(piece => piece !== "");
+        const nodes = pieces.map((piece, pieceIndex) => {
+          if (piece.startsWith("**") && piece.endsWith("**") && piece.length > 4) {
+            return <strong key={pieceIndex}>{piece.slice(2, -2)}</strong>;
+          }
+          if (piece.startsWith("`") && piece.endsWith("`") && piece.length > 2) {
+            return <code className="mono" key={pieceIndex}>{piece.slice(1, -1)}</code>;
+          }
+          return piece;
+        });
+        return <span key={lIndex}>{nodes.length > 0 ? nodes : line}<br /></span>;
+      });
+      blocks.push(<div className="md-p" key={key}>{lines}</div>);
+    });
+  });
+  return blocks;
+}
 
 function pluralFiles(count: number): string {
   const small = count % 10, mid = count % 100;
@@ -83,6 +116,7 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
   const [streaming, setStreaming] = useState(false);
   const [composer, setComposer] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [resumeId, setResumeId] = useState<string>("");
   const [report, setReport] = useState<VerificationReport | null>(null);
   const [providerList, setProviderList] = useState<ProviderDto[] | null>(null);
   const [providerError, setProviderError] = useState<string | null>(null);
@@ -143,6 +177,37 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
 
   const send = async (): Promise<void> => {
     const prompt = composer.trim();
+    if (prompt.startsWith("/")) {
+      const command = prompt.split(/\s+/)[0];
+      if (command === "/new") {
+        setSessionId(null);
+        setMessages([]);
+        setReport(null);
+        setComposer("");
+        return;
+      }
+      if (command === "/clear") {
+        setMessages([]);
+        setReport(null);
+        setComposer("");
+        return;
+      }
+      if (command === "/resume" && resumeId !== "") {
+        setSessionId(resumeId);
+        setMessages([]);
+        setReport(null);
+        setComposer("");
+        return;
+      }
+      if (command === "/help") {
+        setMessages(previous => [...previous, { kind: "system", text: "Команды: /new — новая сессия · /clear — очистить диалог · /resume — продолжить выбранную сессию · /help — эта справка. Бюджет: af budget show · доказательства: af evidence export." }]);
+        setComposer("");
+        return;
+      }
+      setMessages(previous => [...previous, { kind: "system", text: `Неизвестная команда ${command}. /help — список команд.` }]);
+      setComposer("");
+      return;
+    }
     if (abortRef.current || reviewBusy || prompt === "" || health?.status !== "ok") return;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -177,7 +242,8 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
         if (event.type === "delta") setStreamText(previous => previous + event.text);
         else if (event.type === "final") {
           setReport(event.verification_report);
-          setMessages(previous => [...previous, { kind: "assistant", text: event.content, report: event.verification_report }]);
+          const meta: ReplyMeta = { tokens_in: event.tokens_in, tokens_out: event.tokens_out, cost_usd: event.cost_usd };
+          setMessages(previous => [...previous, { kind: "assistant", text: event.content, report: event.verification_report, meta }]);
           setStreamText("");
         } else {
           setMessages(previous => [...previous, { kind: "error", text: event.error }]);
@@ -276,6 +342,14 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
           <div className="ws-tabs">
             <span className="agent-tab"><span className="tdot" /> Рабочая сессия</span>
             <span className="workspace-caption mono">{sessionId === null ? "Локальная среда · Ask · сессия не создана" : `Локальная среда · Ask · ${sessionId.slice(0, 12)}`}</span>
+            <select className="session-select mono" value={resumeId} disabled={streaming || reviewBusy}
+              aria-label="Продолжить сессию"
+              onChange={event => { setResumeId(event.target.value); }}>
+              <option value="">— продолжить сессию —</option>
+              {(sessions?.status === "ok" ? sessions.value.sessions : []).slice(0, 20).map(session => (
+                <option key={session.session_id} value={session.session_id}>{session.session_id.slice(0, 16)}{session.created_at ? ` · ${session.created_at.slice(0, 10)}` : ""}</option>
+              ))}
+            </select>
           </div>
           <div className="dialog" role="log" aria-label="Диалог">
             {messages.length === 0 && !streaming ? (
@@ -301,8 +375,15 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                           <span className={`verify-badge ${message.report.publication === "published" ? "ok" : ""}`}>{PUBLICATION_LABEL[message.report.publication]}</span>
                         </div>
                       )}
-                      <div className="m-text">{message.text}</div>
+                      <div className="m-text">{renderMarkdown(message.text)}</div>
+                      {message.meta !== undefined && (
+                        <div className="m-meta mono">{`tokens: ${message.meta.tokens_in ?? "?"}/${message.meta.tokens_out ?? "?"} · ${message.meta.cost_usd === null ? "cost unknown" : `$${message.meta.cost_usd.toFixed(4)}`}`}</div>
+                      )}
                     </div>
+                  </div>
+                ) : message.kind === "system" ? (
+                  <div className="msg system" key={index}>
+                    <div className="m-body"><div className="sys-text mono">{message.text}</div></div>
                   </div>
                 ) : (
                   <div className="msg assistant" key={index}>
