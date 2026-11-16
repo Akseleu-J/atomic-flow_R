@@ -30,6 +30,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           profile: minimal
+      - name: Pin the beta issuer public key (B1)
+        shell: bash
+        run: echo "AF_BETA_ISSUER_PUBKEY_HEX=b7df426bfbf34584421f38dd4505e6e9a40fc5e4824d31625c5ca39f5e6921ab" >> $GITHUB_ENV
+
       - name: Linux native build dependencies
         if: runner.os == 'Linux'
         run: |

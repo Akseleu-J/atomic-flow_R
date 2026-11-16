@@ -12,7 +12,13 @@ use serde::Deserialize;
 
 /// Pinned at release packaging time (hex). Empty in dev builds: the gate is
 /// then disabled and every check is a pass-through, reported honestly.
-pub const BETA_ISSUER_PUBKEY_HEX: &str = "";
+/// Pinned at release packaging time via AF_BETA_ISSUER_PUBKEY_HEX (see
+/// release.yml). Empty in dev builds: the gate is then disabled and every
+/// check is a pass-through, reported honestly.
+pub const BETA_ISSUER_PUBKEY_HEX: &str = match option_env!("AF_BETA_ISSUER_PUBKEY_HEX") {
+    Some(value) => value,
+    None => "",
+};
 
 const MAX_RESPONSE_BYTES: usize = 4096;
 
