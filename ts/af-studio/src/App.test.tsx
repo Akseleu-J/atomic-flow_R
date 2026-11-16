@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   budget: vi.fn(async () => ({ status: "ok", value: { state: "missing" } })),
   sessions: vi.fn(async () => ({ status: "ok", value: { sessions: [] } })),
   graph: vi.fn(),
+  providers: vi.fn(async () => ({ status: "ok", value: { ok: true, providers: [{ id: "scripted", label: "Локальный тест", models: ["scripted"], available: true, kind: "scripted", accounting: "known_zero" }], error: null, credentials_in_browser: false, budget_enforced: true, unknown_cost_policy: "hold_until_provider_evidence" } })),
   createSession: vi.fn(),
   chat: vi.fn(async () => ({ status: "ok", value: null })),
 }));

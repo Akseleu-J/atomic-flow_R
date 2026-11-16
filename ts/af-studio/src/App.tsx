@@ -10,6 +10,7 @@ import {
   type ChatEvent,
   type GraphFileDto,
   type HealthDto,
+  type ProviderDto,
   type SessionListDto,
   type VerificationReport,
 } from "@atomic-flow/af-client";
@@ -83,10 +84,30 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
   const [composer, setComposer] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [report, setReport] = useState<VerificationReport | null>(null);
+  const [providerList, setProviderList] = useState<ProviderDto[] | null>(null);
+  const [providerError, setProviderError] = useState<string | null>(null);
+  const [selectedProvider, setProvider] = useState(() => window.localStorage.getItem("af.studio.provider") ?? "scripted");
+  const [selectedModel, setModel] = useState(() => window.localStorage.getItem("af.studio.model") ?? "scripted");
   const abortRef = useRef<AbortController | null>(null);
 
   const graphRequest = useRef(0);
   useEffect(() => () => { abortRef.current?.abort(); graphRequest.current++; }, []);
+  useEffect(() => {
+    window.localStorage.setItem("af.studio.provider", selectedProvider);
+    window.localStorage.setItem("af.studio.model", selectedModel);
+  }, [selectedProvider, selectedModel]);
+  // The selection follows the host catalogue: an unknown or unavailable
+  // provider falls back to the scripted local backend, never to a guess.
+  useEffect(() => {
+    if (providerList === null) return;
+    const current = providerList.find(p => p.id === selectedProvider);
+    if (current === undefined || !current.available) {
+      setProvider("scripted");
+      setModel("scripted");
+    } else if (!current.models.includes(selectedModel)) {
+      setModel(current.models[0] ?? "scripted");
+    }
+  }, [providerList, selectedProvider, selectedModel]);
 
   // Single warm-up pass: health, budget, durable session count. No polling,
   // no retry loop — failures stay visible in the status bar and rail badge.
@@ -101,6 +122,14 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
       setBudget(loadedBudget);
       const loadedSessions = await studioApi.sessions(client);
       if (!cancelled) setSessions(loadedSessions);
+      const loadedProviders = await studioApi.providers(client);
+      if (cancelled) return;
+      if (loadedProviders.status === "ok") {
+        setProviderList(loadedProviders.value.providers);
+        setProviderError(null);
+      } else {
+        setProviderError(loadedProviders.message);
+      }
     })();
     return () => { cancelled = true; };
   }, [client]);
@@ -136,9 +165,13 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
       sid = created.value.session_id;
       setSessionId(sid);
     }
+    const scripted = selectedProvider === "scripted" || selectedProvider === "";
+    const backend = scripted
+      ? { provider_id: "scripted", model: "scripted" }
+      : { provider_id: selectedProvider, model: selectedModel };
     const result = await streamChat(
       client,
-      { backend: { provider_id: "scripted", model: "scripted" }, session_id: sid, ...(trimmedRoot === "" ? {} : { root_id: trimmedRoot }), prompt },
+      { backend, session_id: sid, ...(trimmedRoot === "" ? {} : { root_id: trimmedRoot }), prompt },
       (event: ChatEvent) => {
         if (controller.signal.aborted) return;
         if (event.type === "delta") setStreamText(previous => previous + event.text);
@@ -292,6 +325,23 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                 <button className="mode-chip" type="button" disabled title="Правка кода выполняется через host-approved journey; безопасный контракт публикации не подключён">Edit</button>
                 <button className="mode-chip" type="button" disabled title="Планирование и запуск задач появятся после подключения TaskRunner API">Task · скоро</button>
                 <span className="mode-note">Диалог без изменения файлов</span>
+              </div>
+              <div className="provider-row">
+                <select className="provider-select" value={selectedProvider}
+                  disabled={streaming || reviewBusy} aria-label="Провайдер"
+                  onChange={event => setProvider(event.target.value)}>
+                  {(providerList ?? []).map(p => (
+                    <option key={p.id} value={p.id} disabled={!p.available}>{p.label}{p.available ? "" : " · ключ не найден в среде"}</option>
+                  ))}
+                </select>
+                <select className="provider-select mono" value={selectedModel}
+                  disabled={streaming || reviewBusy} aria-label="Модель"
+                  onChange={event => setModel(event.target.value)}>
+                  {(providerList?.find(p => p.id === selectedProvider)?.models ?? ["scripted"]).map(model => (
+                    <option key={model} value={model}>{model}</option>
+                  ))}
+                </select>
+                {providerError !== null && <span className="provider-err">каталог провайдеров: {providerError}</span>}
               </div>
               <div className="input-row">
                 <textarea

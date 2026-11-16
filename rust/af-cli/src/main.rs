@@ -4,6 +4,12 @@
 //! the explicit `--host-approved` flag: the human running the CLI is the host.
 
 mod behavioral_checker;
+/// Serialize every test that mutates ATOMIC_FLOW_HOME: the env variable
+/// is process-global and parallel tests would otherwise cross-contaminate
+/// each other's user_dir resolution (the server-test HOME_LOCK pattern).
+#[cfg(test)]
+pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod beta_gate;
 mod crash_log;
 mod dashboard;

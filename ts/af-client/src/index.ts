@@ -19,6 +19,8 @@ export interface JourneysReport { ok: boolean; verified: false; refusal: Record<
 export interface JobsStatus { ok: true; jobs: Record<string, unknown>[]; unresolved_unknown_ids: string[] }
 export interface RequestContextSource { root_id: string; path: string; sha256: string; start_line: number; end_line: number; kind: "request_context"; verification: "not_assessed" }
 export interface ChatInput { backend: BackendSelection; prompt: string; session_id?: string; root_id?: string }
+export interface ProviderDto { id: string; label: string; models: string[]; available: boolean; kind: "scripted" | "openai-compatible"; accounting: string }
+export interface ProvidersDto { ok: true; providers: ProviderDto[]; error: string | null; credentials_in_browser: false; budget_enforced: true; unknown_cost_policy: string }
 export type ChatEvent = { type: "delta"; text: string } | {
   type: "final" | "error"; ok: boolean; content: string; tokens_in: number | null; tokens_out: number | null;
   cost_usd: number | null; truncated: boolean; verification: "not_assessed"; verification_report: VerificationReport;
@@ -121,6 +123,30 @@ export class AfClient {
     const body = { ...(id === undefined ? {} : { id: text(id) }), ...(rootId === undefined ? {} : { root_id: text(rootId) }) };
     const r = exact(await this.json("/v1/sessions", { method: "POST", body: JSON.stringify(body) }), ["ok", "session_id", "path"]);
     return { ok: literal(r.ok, true), session_id: text(r.session_id), path: text(r.path, 4096) };
+  }
+  /** Host-owned provider catalogue: the browser selects an id and a
+   *  model; keys and endpoints never leave the host. */
+  async providers(): Promise<ProvidersDto> {
+    const r = exact(await this.json("/v1/providers"), ["ok", "providers", "error", "credentials_in_browser", "budget_enforced", "unknown_cost_policy"]);
+    ensure(r.ok === true, "providers ok");
+    return {
+      ok: literal(r.ok, true),
+      providers: list(r.providers, 16).map(item => {
+        const p = exact(item, ["id", "label", "models", "available", "kind", "accounting"]);
+        return {
+          id: text(p.id, 96),
+          label: text(p.label, 100),
+          models: strings(p.models, 32),
+          available: bool(p.available),
+          kind: oneOf(p.kind, ["scripted", "openai-compatible"] as const),
+          accounting: text(p.accounting, 64),
+        };
+      }),
+      error: r.error === null ? null : text(r.error, 256),
+      credentials_in_browser: literal(r.credentials_in_browser, false),
+      budget_enforced: literal(r.budget_enforced, true),
+      unknown_cost_policy: literal(r.unknown_cost_policy, "hold_until_provider_evidence"),
+    };
   }
   async readSession(sessionId: string): Promise<SessionSnapshot> {
     return validateSessionSummary(await this.json(`/v1/sessions/${identifier(sessionId)}`));

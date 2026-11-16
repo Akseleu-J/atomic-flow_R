@@ -93,6 +93,7 @@ mod tests {
 
     #[test]
     fn crash_records_append_and_summarize() {
+        let _home_guard = crate::TEST_HOME_LOCK.lock().unwrap();
         // Isolated home for the test home directory.
         let home = std::env::temp_dir().join(format!(
             "af-crash-test-{}-{}",

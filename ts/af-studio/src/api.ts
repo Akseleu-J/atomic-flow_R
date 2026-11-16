@@ -10,6 +10,7 @@ import {
   type ChatEvent,
   type ChatInput,
   type GraphReadDto,
+  type ProvidersDto,
   type HealthDto,
   type SessionCreated,
   type SessionListDto,
@@ -47,6 +48,7 @@ export const studioApi = {
   session: (client: AfClient, sessionId: string): Promise<StudioResult<SessionSummaryDto>> => guard(() => client.readSession(sessionId)),
   budget: (client: AfClient): Promise<StudioResult<BudgetSnapshotDto>> => guard(() => client.readBudget()),
   graph: (client: AfClient, rootId: string): Promise<StudioResult<GraphReadDto>> => guard(() => client.readGraph(rootId)),
+  providers: (client: AfClient): Promise<StudioResult<ProvidersDto>> => guard(() => client.providers()),
   createSession: (client: AfClient, rootId?: string): Promise<StudioResult<SessionCreated>> => guard(() => client.createSession(undefined, rootId)),
 };
 

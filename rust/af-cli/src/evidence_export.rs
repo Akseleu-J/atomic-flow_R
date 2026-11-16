@@ -86,6 +86,7 @@ mod tests {
 
     #[test]
     fn export_redacts_payloads_by_default_and_includes_on_request() {
+        let _home_guard = crate::TEST_HOME_LOCK.lock().unwrap();
         std::env::set_var(
             "ATOMIC_FLOW_HOME",
             std::env::temp_dir().join(format!(

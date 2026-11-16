@@ -67,6 +67,7 @@ test('session requests use root ID; snapshots require actual root/hold fields', 
 test('sessions list, budget snapshot and graph read are validated field-by-field', async () => {
   const sdk = client(async url => {
     if (url.endsWith('/v1/sessions')) return json({ ok: true, sessions: [{ session_id: 's1', created_at: null, project: null }, { id: 's2' }] });
+    if (url.endsWith('/v1/providers')) return json({ ok: true, providers: [{ id: 'scripted', label: 'Local test', models: ['scripted'], available: true, kind: 'scripted', accounting: 'known_zero' },{ id: 'openrouter', label: 'OpenRouter', models: ['gpt-4o-mini'], available: false, kind: 'openai-compatible', accounting: 'durable_reservation' }], error: null, credentials_in_browser: false, budget_enforced: true, unknown_cost_policy: 'hold_until_provider_evidence' });
     if (url.endsWith('/v1/budget')) return json({ state: 'hold', committed_usd: 'unknown', committed_basis: 'known_spend_plus_reservations', spent_usd_known: null, reserved_usd: '0.01', unknown_cost_present: true, available_usd: null, cap_usd: '1', calls: 3, send_hold: true, enforced: true, provider_mode: 'host_configured_or_scripted' });
     return json({ ok: true, root_id: 'main', files: [{ path: 'src/main.py', layer: 'entry', symbols: ['main', ''] }], nodes: 4, edges: 2 });
   });

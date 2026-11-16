@@ -125,6 +125,7 @@ mod tests {
 
     #[test]
     fn init_is_idempotent_and_respects_the_cap() {
+        let _home_guard = crate::TEST_HOME_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "af-init-test-{}-{}",
             std::process::id(),
