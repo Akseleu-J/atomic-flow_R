@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { AfClient, AfHttpError, AfProtocolError, AfTransportError, WireError, parseVerificationReport } from '../dist/index.js';
 
-const vectors = JSON.parse(await readFile(new URL('../../../rust/af-evidence/fixtures/wire-v1.json', import.meta.url), 'utf8'));
+const vectors = JSON.parse(await readFile(new URL('../../../rust/af-evidence/fixtures/wire-v2.json', import.meta.url), 'utf8'));
 const baseline = JSON.parse(vectors.cases.find(c => c.name === 'empty_not_assessed').json);
 const health = { ok: true, version: '0.1.0', kernel: 'atomic-flow-rust' };
 const capabilities = { schema_version: 1, verification_schema_version: 2, authority: 'single_owner', requirement_checker: 'unavailable', verification_report_authorizes_execution: false, publication_recovery: 'host_cli_preview_digest', unknown_replay: false };

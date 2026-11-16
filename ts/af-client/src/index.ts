@@ -92,7 +92,9 @@ export class AfClient {
   constructor(options: AfClientOptions) {
     this.baseUrl = secureBase(options.baseUrl);
     this.headers = options.token === undefined ? {} : { Authorization: `Bearer ${text(options.token, 8192)}` };
-    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    // Browsers require fetch to be invoked with the window receiver;
+    // a detached `this.fetchImpl(...)` call throws Illegal invocation.
+    this.fetchImpl = (options.fetchImpl ?? globalThis.fetch).bind(globalThis);
     this.maxResponseBytes = options.maxResponseBytes === undefined ? 1_048_576 : uint(options.maxResponseBytes, 4_194_304);
     ensure(this.maxResponseBytes > 0, "positive response limit required");
     this.timeoutMs = options.timeoutMs === undefined ? 30_000 : uint(options.timeoutMs, 120_000);

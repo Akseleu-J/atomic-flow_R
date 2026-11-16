@@ -1,4 +1,4 @@
-import { byteLength, ensure, exact, list, oneOf, parseJson, sha256Label, text, uint } from "./wire.js";
+import { bool, byteLength, ensure, exact, list, oneOf, parseJson, sha256Label, strings, text, uint } from "./wire.js";
 
 export type Assessment = "not_assessed" | "not_applicable" | "passed" | "failed" | "unavailable";
 export interface CheckSummary { status: Assessment; checked: number; passed: number; failed: number; denominator: number }
@@ -7,10 +7,16 @@ export type OmissionReason = "stale" | "denied" | "unreadable" | "unsupported" |
 export interface Omission { source_id: string; reason: OmissionReason }
 export interface Citation { source_id: string; node_id: string; source_revision: string; source_sha256: string; start_byte: number; end_byte: number; quote: string; quote_sha256: string }
 export interface Claim { claim_id: string; text: string; citation_indices: number[]; entailment: "not_assessed" | "supported" | "contradicted"; independent_checker: string | null }
+export interface EnrichmentSummary {
+  status: "answer" | "no_answer" | "unavailable"; kind: "tour" | "impact";
+  cached: boolean; call_ref: string | null;
+  completeness: "full" | "partial" | "none" | null; coverage: string[]
+}
 export interface VerificationReport {
-  schema_version: 1; binding: SourceBinding;
+  schema_version: 2; binding: SourceBinding;
   identifier_hygiene: CheckSummary; citation_validity: CheckSummary;
   evidence_coverage: { requested: number; delivered_complete: number; delivered_partial: number; omissions: Omission[] };
+  enrichment: EnrichmentSummary | null;
   syntax: CheckSummary; tests: CheckSummary; requirements: CheckSummary; model_critique: CheckSummary;
   publication: "not_requested" | "not_authorized" | "pending" | "published" | "failed" | "unknown";
   citations: Citation[]; claims: Claim[];
@@ -35,8 +41,8 @@ export async function parseVerificationReport(raw: string): Promise<Verification
 }
 export async function validateVerificationReport(value: unknown): Promise<VerificationReport> {
   ensure(byteLength(JSON.stringify(value)) <= MAX_VERIFICATION_BYTES, "report byte limit");
-  const r = exact(value, ["schema_version", "binding", "identifier_hygiene", "citation_validity", "evidence_coverage", "syntax", "tests", "requirements", "model_critique", "publication", "citations", "claims"]);
-  ensure(r.schema_version === 1, "unsupported verification schema");
+  const r = exact(value, ["schema_version", "binding", "identifier_hygiene", "citation_validity", "evidence_coverage", "enrichment", "syntax", "tests", "requirements", "model_critique", "publication", "citations", "claims"]);
+  ensure(r.schema_version === 2, "unsupported verification schema");
   const b = exact(r.binding, ["workspace_id", "source_revision", "inventory_sha256", "runtime_id"]);
   const binding = { workspace_id: text(b.workspace_id), source_revision: text(b.source_revision), inventory_sha256: sha256Label(b.inventory_sha256), runtime_id: text(b.runtime_id) };
   const e = exact(r.evidence_coverage, ["requested", "delivered_complete", "delivered_partial", "omissions"]);
@@ -46,6 +52,23 @@ export async function validateVerificationReport(value: unknown): Promise<Verifi
   });
   const evidence_coverage = { requested: uint(e.requested), delivered_complete: uint(e.delivered_complete), delivered_partial: uint(e.delivered_partial), omissions };
   ensure(evidence_coverage.delivered_complete + evidence_coverage.delivered_partial + omissions.length === evidence_coverage.requested && new Set(omissions.map(o => o.source_id)).size === omissions.length, "coverage bounds");
+  // N05 (ADR-0002 D5): the enrichment summary is data-only; the mirror of
+  // the rust-side coupling rules applies here with no authority implied.
+  let enrichment: EnrichmentSummary | null = null;
+  if (r.enrichment !== null) {
+    const en = exact(r.enrichment, ["status", "kind", "cached", "call_ref", "completeness", "coverage"]);
+    const status = oneOf(en.status, ["answer", "no_answer", "unavailable"]);
+    const kind = oneOf(en.kind, ["tour", "impact"]);
+    const cached = en.cached === true;
+    const call_ref = en.call_ref === null ? null : text(en.call_ref, 128);
+    const completeness = en.completeness === null ? null : oneOf(en.completeness, ["full", "partial", "none"]);
+    const coverage = strings(en.coverage, 256).map(c => text(c, 256));
+    ensure(
+      (status === "answer" ? completeness !== null : completeness === null),
+      "enrichment status/completeness coupling"
+    );
+    enrichment = { status, kind, cached, call_ref, completeness, coverage };
+  }
   const citations: Citation[] = [];
   for (const value of list(r.citations)) {
     const c = exact(value, ["source_id", "node_id", "source_revision", "source_sha256", "start_byte", "end_byte", "quote", "quote_sha256"]);
@@ -66,5 +89,5 @@ export async function validateVerificationReport(value: unknown): Promise<Verifi
     ensure(entailment === "not_assessed" ? independent_checker === null : independent_checker !== null && citation_indices.length > 0, "independent checker required");
     return { claim_id, text: claimText, citation_indices, entailment, independent_checker };
   });
-  return { schema_version: 1, binding, identifier_hygiene: check(r.identifier_hygiene), citation_validity: check(r.citation_validity), evidence_coverage, syntax: check(r.syntax), tests: check(r.tests), requirements: check(r.requirements), model_critique: check(r.model_critique), publication: oneOf(r.publication, ["not_requested", "not_authorized", "pending", "published", "failed", "unknown"]), citations, claims };
+  return { schema_version: 2, binding, identifier_hygiene: check(r.identifier_hygiene), citation_validity: check(r.citation_validity), evidence_coverage, syntax: check(r.syntax), tests: check(r.tests), requirements: check(r.requirements), model_critique: check(r.model_critique), publication: oneOf(r.publication, ["not_requested", "not_authorized", "pending", "published", "failed", "unknown"]), enrichment, citations, claims };
 }
