@@ -43,7 +43,7 @@ const PUBLICATION_LABEL: Record<VerificationReport["publication"], string> = {
   unknown: "публикация неизвестна",
 };
 
-interface DialogMessage { kind: "user" | "assistant" | "error" | "system"; text: string; report?: VerificationReport }
+interface DialogMessage { kind: "user" | "assistant" | "error" | "system"; text: string; report?: VerificationReport; meta?: ReplyMeta }
 interface ReplyMeta { tokens_in: number | null; tokens_out: number | null; cost_usd: number | null }
 
 /** Bounded markdown-lite: fenced code, inline code, bold, paragraphs.
