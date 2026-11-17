@@ -39,7 +39,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
-      - name: Record source
+      - name: Set reproducible build environment
+        shell: bash
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
+          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
+          echo "RUSTFLAGS=--remap-path-prefix $HOME/.cargo=/cargo --remap-path-prefix $GITHUB_WORKSPACE=/build" >> $GITHUB_ENV
         shell: bash
         run: |
           mkdir -p dist
@@ -82,6 +87,13 @@ jobs:
         with:
           name: engineer-beta-${{ matrix.os }}
           path: beta/
+      - name: Generate SBOM (cargo auditable)
+        shell: bash
+        run: |
+          cargo install cargo-auditable --locked 2>&1 | tail -1 || true
+          cargo auditable build --release -p af-cli 2>&1 | tail -1
+          cargo tree --locked > beta/dependency-tree.txt
+
       - name: Package (windows zip)
         if: matrix.archive == 'zip'
         shell: pwsh
