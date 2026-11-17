@@ -773,10 +773,12 @@ async fn task_run_ep(
             body.budget_cap_usd.clone(),
         );
         match result {
-            Ok(text) => serde_json::from_str::<Value>(&text)
-                .unwrap_or_else(|_| json!({"raw": text})),
-            Err(text) => serde_json::from_str::<Value>(&text)
-                .unwrap_or_else(|_| json!({"error": text})),
+            Ok(text) => {
+                serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"raw": text}))
+            }
+            Err(text) => {
+                serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"error": text}))
+            }
         }
     })
     .await
