@@ -403,6 +403,21 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                 <option key={session.session_id} value={session.session_id}>{session.session_id.slice(0, 16)}{session.created_at ? ` · ${session.created_at.slice(0, 10)}` : ""}</option>
               ))}
             </select>
+            {sessionId !== null && resumeId === "" && (
+              <button className="mini-btn" type="button"
+                onClick={() => {
+                  fetch(`/v1/sessions/${sessionId}/rewind`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+                    body: JSON.stringify({ target_seq: 99999 })
+                  }).then(r => r.json()).then(result => {
+                    setMessages(previous => [...previous, { kind: "system", text: `Session rewound. ${result?.superseded ?? 0} events superseded (history preserved).` }]);
+                  }).catch(e => {
+                    setMessages(previous => [...previous, { kind: "error", text: `Rewind failed: ${e}` }]);
+                  });
+                }}
+              >⟲ Rewind</button>
+            )}
           </div>
           <div className="dialog" role="log" aria-label="Диалог">
             {messages.length === 0 && !streaming ? (
