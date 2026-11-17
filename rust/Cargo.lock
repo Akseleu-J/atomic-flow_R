@@ -35,6 +35,7 @@ dependencies = [
  "af-entropy",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -133,6 +134,7 @@ version = "0.1.0"
 dependencies = [
  "af-entropy",
  "serde_json",
+ "thiserror",
  "ureq",
 ]
 
