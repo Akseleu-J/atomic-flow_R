@@ -825,6 +825,67 @@ impl SessionJournal {
     }
 
     /// Preserve and remove only uncommitted tail bytes; do not replay effects.
+    /// Rewind the session to a specific sequence number: the full history
+    /// is preserved (append-only contract), a snapshot event is written so
+    /// the UI can render the state at that point, and all events after the
+    /// target are marked as superseded (their effects are NOT undone —
+    /// journal effects like holds and evidence stay).
+    /// Returns the number of events that were superseded.
+    pub fn rewind_to_seq(&mut self, target_seq: usize) -> JournalResult<usize> {
+        let snapshot = self.read()?;
+        let target = snapshot
+            .events
+            .iter()
+            .find(|e| e.get("seq").and_then(Value::as_u64) == Some(target_seq as u64))
+            .ok_or_else(|| JournalError("target seq not found".into()))?;
+        // Count events after the target
+        let superseded = snapshot
+            .events
+            .iter()
+            .filter(|e| {
+                let seq = e.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                seq > target_seq as u64
+            })
+            .count();
+        // Write a rewind marker event
+        self.append(
+            "rewind_applied",
+            &json!({
+                "target_seq": target_seq,
+                "superseded_count": superseded,
+                "rewound_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            }),
+            None,
+            None,
+            None,
+        )?;
+        Ok(superseded)
+    }
+
+    /// Create a named snapshot of the current dialog state for later restore.
+    /// The snapshot preserves the full event history (append-only).
+    pub fn create_snapshot(&mut self, label: &str) -> JournalResult<Value> {
+        let snapshot = self.read()?;
+        let event = self.append(
+            "snapshot_created",
+            &json!({
+                "label": label,
+                "last_seq": snapshot.events.last()
+                    .and_then(|e| e.get("seq"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "event_count": snapshot.events.len(),
+            }),
+            None,
+            None,
+            None,
+        )?;
+        Ok(event)
+    }
+
     pub fn recover_tail(&mut self) -> JournalResult<Option<PathBuf>> {
         let _lease = Self::lease(&self.path)?;
         let snapshot = self.read()?;

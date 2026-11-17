@@ -15,8 +15,34 @@ pub(super) fn routes() -> Router<ServerState> {
     Router::new()
         .route("/v1/sessions/{id}/history", get(history))
         .route("/v1/sessions/{id}/snapshot", post(snapshot))
+        .route("/v1/sessions/{id}/rewind", post(session_rewind))
         .route("/v1/roots/{root_id}/file", get(source_file))
         .route("/v1/providers", get(providers))
+}
+
+async fn session_rewind(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    if auth_denied(&state, &headers).is_some() {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let target_seq = body
+        .get("target_seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "target_seq required"))?
+        as usize;
+    let mut journal = af_journal::SessionJournal::open(&id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "session not found"))?;
+    let superseded = journal
+        .rewind_to_seq(target_seq)
+        .map_err(|_| api_error(StatusCode::CONFLICT, "rewind failed"))?;
+    Ok(Json(json!({
+        "ok": true, "rewound_to": target_seq, "superseded": superseded,
+        "note": "history preserved; effects (holds, evidence) NOT undone"
+    })))
 }
 
 async fn providers(State(state): State<ServerState>, headers: HeaderMap) -> ApiResult {
