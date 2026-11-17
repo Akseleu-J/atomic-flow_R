@@ -115,6 +115,10 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
   const [streamText, setStreamText] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [composer, setComposer] = useState("");
+  const [mode, setMode] = useState<"ask" | "edit" | "task">("ask");
+  const [editFile, setEditFile] = useState("");
+  const [editReplacement, setEditReplacement] = useState("");
+  const [editBusy, setEditBusy] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [resumeId, setResumeId] = useState<string>("");
   const [report, setReport] = useState<VerificationReport | null>(null);
@@ -175,7 +179,56 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
     setGraph(result.status === "ok" ? { status: "ok", value: result.value.files } : result);
   };
 
+  const sendTaskRun = async (): Promise<void> => {
+    if (abortRef.current || health?.status !== "ok") return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStreaming(true);
+    setMessages(previous => [...previous, { kind: "user", text: composer }]);
+    const trimmedRoot = rootId.trim();
+    const provider = selectedProvider === "scripted" ? "scripted" : selectedProvider;
+    const modelArg = selectedProvider === "scripted" ? "scripted" : selectedModel;
+    try {
+      const response = await fetch("/v1/task-run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ root_id: trimmedRoot, file: editFile || "unknown", replacement: composer, goal: composer,
+          backend: { provider_id: provider ?? "scripted", model: modelArg }, budget_cap_usd: null }),
+      });
+      const data = await response.json();
+      setMessages(previous => [...previous, { kind: "assistant", text: JSON.stringify(data, null, 2).slice(0, 2000) }]);
+    } catch (error) { setMessages(previous => [...previous, { kind: "error", text: String(error) }]); }
+    abortRef.current = null;
+    setStreaming(false);
+    setComposer("");
+  };
+
+  const sendEditJourney = async (): Promise<void> => {
+    if (abortRef.current || health?.status !== "ok" || editFile === "") return;
+    setEditBusy(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setMessages(previous => [...previous, { kind: "user", text: `[Edit] ${editFile}: ${composer}` }]);
+    const provider = selectedProvider === "scripted" ? "scripted" : selectedProvider;
+    try {
+      const response = await fetch("/v1/edit-journeys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ root_id: rootId.trim(), file: editFile, replacement: editReplacement || composer, goal: composer,
+          backend: { provider_id: provider, model: selectedModel }, host_approved: true }),
+      });
+      const data = await response.json();
+      setMessages(previous => [...previous, { kind: "assistant", text: JSON.stringify(data, null, 2).slice(0, 2000) }]);
+    } catch (error) { setMessages(previous => [...previous, { kind: "error", text: String(error) }]); }
+    setEditBusy(false);
+    abortRef.current = null;
+    setComposer("");
+    setEditReplacement("");
+  };
+
   const send = async (): Promise<void> => {
+    if (mode === "edit") { void sendEditJourney(); return; }
+    if (mode === "task") { void sendTaskRun(); return; }
     const prompt = composer.trim();
     if (prompt.startsWith("/")) {
       const command = prompt.split(/\s+/)[0];
@@ -403,9 +456,9 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
             <div className="composer">
               <div className="mode-row">
                 <button className="mode-chip active" type="button" title="Диалог без изменения файлов">Ask</button>
-                <button className="mode-chip" type="button" disabled title="Правка кода выполняется через host-approved journey; безопасный контракт публикации не подключён">Edit</button>
-                <button className="mode-chip" type="button" disabled title="Планирование и запуск задач появятся после подключения TaskRunner API">Task · скоро</button>
-                <span className="mode-note">Диалог без изменения файлов</span>
+                <button className={`mode-chip ${mode === "edit" ? "active" : ""}`} type="button" onClick={() => setMode(mode === "edit" ? "ask" : "edit")} title="Правка кода через host-approved journey">Edit</button>
+                <button className={`mode-chip ${mode === "task" ? "active" : ""}`} type="button" onClick={() => setMode(mode === "task" ? "ask" : "task")} title="Планирование и запуск задач через task_run">Task</button>
+                <span className="mode-note">{mode === "ask" ? "Диалог без изменения файлов" : mode === "edit" ? "Правка через host-approved journey" : "Задача через task_run"}</span>
               </div>
               <div className="provider-row">
                 <select className="provider-select" value={selectedProvider}
@@ -424,7 +477,16 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                 </select>
                 {providerError !== null && <span className="provider-err">каталог провайдеров: {providerError}</span>}
               </div>
-              <div className="input-row">
+              {mode === "edit" && (
+  <div className="edit-mode-row">
+    <select className="provider-select mono" value={editFile} onChange={e => setEditFile(e.target.value)} aria-label="Файл">
+      <option value="">— выберите файл —</option>
+      {(files ?? []).map(f => <option key={f.path} value={f.path}>{f.path}</option>)}
+    </select>
+    <textarea className="edit-replacement mono" rows={4} placeholder="Замена..." value={editReplacement} onChange={e => setEditReplacement(e.target.value)} aria-label="Замена" />
+  </div>
+)}
+<div className="input-row">
                 <textarea
                   value={composer}
                   rows={1}
@@ -437,7 +499,7 @@ function Workspace({ token, connect }: { token: string; connect: (token: string)
                   }}
                 />
                 {streaming && <button className="stop-btn" type="button" onClick={stop}>Стоп</button>}
-                <button className="send-btn" type="button" onClick={() => { void send(); }} disabled={streaming || reviewBusy || health?.status !== "ok" || composer.trim() === ""} aria-label="Отправить" title="Отправить (Enter)">➤</button>
+                <button className="send-btn" type="button" onClick={() => { void send(); }} disabled={streaming || editBusy || reviewBusy || health?.status !== "ok" || (mode === "ask" && composer.trim() === "") || (mode === "edit" && editFile === "")} aria-label="Отправить" title="Отправить (Enter)">➤</button>
               </div>
               <div className="composer-foot"><span>Enter — отправить · Shift+Enter — новая строка</span><span>Esc — остановить</span></div>
             </div>

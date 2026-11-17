@@ -100,6 +100,7 @@ fn build_router_for(
         .route("/v1/sessions/{id}/events", post(append_event))
         .route("/v1/sessions/{id}", get(read_session))
         .route("/v1/edit-journeys", post(edit_journey))
+        .route("/v1/task-run", post(task_run_ep))
         .route(
             "/v1/reviewed-edit",
             get(reviewed_edit::inspect).post(reviewed_edit::apply),
@@ -717,6 +718,70 @@ struct BackendConfig {
     api_key_env: String,
     model: String,
     provider_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRunBody {
+    root_id: String,
+    file: String,
+    replacement: String,
+    goal: String,
+    backend: BackendConfig,
+    #[serde(default)]
+    budget_cap_usd: Option<String>,
+    #[serde(default)]
+    check_argv: Option<String>,
+    #[serde(default)]
+    junit: Option<String>,
+}
+
+/// Full native task vertical: durable admission → guided edit journey →
+/// host requirement gate → queue resolution. Blocking call inside
+/// spawn_blocking; the studio shows the result when it completes.
+async fn task_run_ep(
+    State(_state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<TaskRunBody>,
+) -> Result<Json<Value>, StatusCode> {
+    if auth_denied(&_state, &headers).is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if body.root_id.is_empty()
+        || body.file.is_empty()
+        || body.replacement.is_empty()
+        || body.goal.is_empty()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let backend = backend_from_config(&body.backend)?;
+    drop(backend); // task_run builds its own backend from the config
+    let check_argv = body.check_argv.clone();
+    let junit = body.junit.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = crate::task_run(
+            body.root_id.clone(),
+            body.file.clone(),
+            body.replacement.clone(),
+            body.goal.clone(),
+            body.backend.provider_id.clone(),
+            body.backend.base_url.clone(),
+            body.backend.api_key_env.clone(),
+            body.backend.model.clone(),
+            check_argv,
+            junit.map(std::path::PathBuf::from),
+            body.budget_cap_usd.clone(),
+        );
+        match result {
+            Ok(text) => serde_json::from_str::<Value>(&text)
+                .unwrap_or_else(|_| json!({"raw": text})),
+            Err(text) => serde_json::from_str::<Value>(&text)
+                .unwrap_or_else(|_| json!({"error": text})),
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    .map(Json)
 }
 
 async fn edit_journey(

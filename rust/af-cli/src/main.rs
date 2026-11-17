@@ -904,7 +904,7 @@ fn doctor_hint(name: &str) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn task_run(
+pub(crate) fn task_run(
     root_id: String,
     file: String,
     replacement: String,
