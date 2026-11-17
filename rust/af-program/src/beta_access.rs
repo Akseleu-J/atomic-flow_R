@@ -61,6 +61,45 @@ impl Challenge {
     }
 }
 
+/// Offline pass verification: no service, no challenge, no freshness.
+/// A signed pass file (issued once, emailed to the participant) is checked
+/// against the pinned issuer public key and the local clock. Clock rollback
+/// cannot be defeated offline — this is the accepted trade-off for the
+/// self-hosted beta (owner decision 17.11).
+pub fn verify_offline_pass(
+    issuer_key: &[u8; 32],
+    body: &[u8],
+    signature: &[u8; 64],
+    expected_grant: &str,
+    expected_release: &str,
+    now: u64,
+) -> Result<AccessDecision, AccessError> {
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(AccessError::Invalid);
+    }
+    let message = [SIGNING_DOMAIN, body].concat();
+    UnparsedPublicKey::new(&ED25519, issuer_key)
+        .verify(message.as_slice(), signature.as_slice())
+        .map_err(|_| AccessError::Invalid)?;
+    let decision: AccessDecision =
+        serde_json::from_slice(body).map_err(|_| AccessError::Invalid)?;
+    if decision.schema_version != 1
+        || !identifier(&decision.grant_id)
+        || !identifier(&decision.release_id)
+        || decision.grant_id != expected_grant
+        || decision.release_id != expected_release
+        || decision.activated_at > decision.checked_at
+        || !(1..=MAX_BETA_SECONDS)
+            .contains(&decision.expires_at.saturating_sub(decision.activated_at))
+    {
+        return Err(AccessError::Invalid);
+    }
+    if !decision.active || now >= decision.expires_at {
+        return Err(AccessError::Inactive);
+    }
+    Ok(decision)
+}
+
 pub fn verify_access(
     issuer_key: &[u8; 32],
     body: &[u8],
