@@ -241,6 +241,28 @@ def fixture(out_path: Path) -> None:
     print(f"frozen vector written: {out_path}")
 
 
+def generate_offline_pass(key_path: Path, out_path: str, grant_id: str, release_id: str) -> None:
+    """Generate a signed offline pass JSON file (no server needed). The
+    participant saves this to ~/.atomic_flow/beta-pass.json and the af
+    binary verifies it locally via verify_offline_pass."""
+    now = int(time.time())
+    challenge = os.urandom(32).hex()
+    body = make_decision(grant_id, release_id, challenge, now,
+                         now + MAX_BETA_SECONDS, now)
+    signature = sign(Path(key_path), body)
+    pass_data = {
+        "decision_b64": base64.b64encode(body).decode(),
+        "signature_hex": signature.hex(),
+        "grant_id": grant_id,
+        "release_id": release_id,
+    }
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(pass_data, indent=1))
+    print(f"offline pass written: {out} ({len(body)}B body, {len(signature)}B sig)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--generate-key")
@@ -251,6 +273,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--fixture")
+    parser.add_argument("--generate-pass", help="output path for the signed pass JSON")
+    parser.add_argument("--grant", help="grant id for --generate-pass")
+    parser.add_argument("--release", help="release id for --generate-pass")
     args = parser.parse_args()
     if args.generate_key:
         generate_key(Path(args.generate_key))
@@ -258,6 +283,10 @@ if __name__ == "__main__":
         selftest()
     elif args.fixture:
         fixture(Path(args.fixture))
+    elif args.generate_pass:
+        generate_offline_pass(
+            Path(args.key), args.generate_pass, args.grant, args.release
+        )
     elif args.serve:
         serve(args)
     else:
