@@ -759,25 +759,39 @@ async fn task_run_ep(
     let check_argv = body.check_argv.clone();
     let junit = body.junit.clone();
     tokio::task::spawn_blocking(move || {
-        let result = crate::task_run(
-            body.root_id.clone(),
-            body.file.clone(),
-            body.replacement.clone(),
-            body.goal.clone(),
-            body.backend.provider_id.clone(),
-            body.backend.base_url.clone(),
-            body.backend.api_key_env.clone(),
-            body.backend.model.clone(),
-            check_argv,
-            junit.map(std::path::PathBuf::from),
-            body.budget_cap_usd.clone(),
-        );
+        // catch_unwind prevents a task_run panic from crashing the serve process
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::task_run(
+                body.root_id.clone(),
+                body.file.clone(),
+                body.replacement.clone(),
+                body.goal.clone(),
+                body.backend.provider_id.clone(),
+                body.backend.base_url.clone(),
+                body.backend.api_key_env.clone(),
+                body.backend.model.clone(),
+                check_argv,
+                junit.map(std::path::PathBuf::from),
+                body.budget_cap_usd.clone(),
+            )
+        }));
         match result {
-            Ok(text) => {
+            Ok(Ok(text)) => {
                 serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"raw": text}))
             }
-            Err(text) => {
+            Ok(Err(text)) => {
                 serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"error": text}))
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "opaque panic".to_string());
+                json!({
+                    "error": format!("task_run panicked: {msg}"),
+                    "panic": true,
+                })
             }
         }
     })
