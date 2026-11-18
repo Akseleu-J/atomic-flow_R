@@ -17,6 +17,7 @@ pub const BETA_ISSUER_PUBKEY_HEX: &str = match option_env!("AF_BETA_ISSUER_PUBKE
 };
 
 const MAX_RESPONSE_BYTES: usize = 4096;
+const OFFLINE_PASS_FILE: &str = "beta-pass.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateConfig {
@@ -176,7 +177,57 @@ fn decision_provenance(body: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
+pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(pass_path).map_err(|e| format!("beta pass read failed: {e}"))?;
+    let pass: Value =
+        serde_json::from_str(&text).map_err(|_| "beta pass is not valid JSON".to_string())?;
+    let body_b64 = pass
+        .get("decision_b64")
+        .and_then(Value::as_str)
+        .ok_or("beta pass missing decision_b64")?;
+    let sig_hex = pass
+        .get("signature_hex")
+        .and_then(Value::as_str)
+        .ok_or("beta pass missing signature_hex")?;
+    let body = base64_decode(body_b64)?;
+    let signature = hex_64(sig_hex)?;
+    let pubkey_hex = std::env::var("AF_BETA_ISSUER_PUBKEY")
+        .unwrap_or_else(|_| BETA_ISSUER_PUBKEY_HEX.to_string());
+    let issuer_key = hex_32(&pubkey_hex).ok_or("beta issuer pubkey is invalid")?;
+    let grant_id = pass
+        .get("grant_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let release_id = pass
+        .get("release_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let _decision = af_program::beta_access::verify_offline_pass(
+        &issuer_key,
+        &body,
+        &signature,
+        &grant_id,
+        &release_id,
+        now,
+    )
+    .map_err(|e| match e {
+        af_program::beta_access::AccessError::Inactive => {
+            "beta access expired - the pass window has closed".to_string()
+        }
+        _ => "beta pass is invalid (wrong grant/release or tampered)".to_string(),
+    })?;
+    Ok(())
+}
+
 pub fn gate_new_operation(now: u64) -> Result<(), String> {
+    // Offline mode: a signed pass file replaces the online service check.
+    let pass_file = af_sandbox::user_dir().join(OFFLINE_PASS_FILE);
+    if pass_file.exists() {
+        return gate_offline_pass(&pass_file, now);
+    }
     match GateConfig::from_env() {
         None => Ok(()),
         Some(config) => match check(&config, now)? {
