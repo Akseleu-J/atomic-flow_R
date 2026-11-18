@@ -833,11 +833,13 @@ impl SessionJournal {
     /// Returns the number of events that were superseded.
     pub fn rewind_to_seq(&mut self, target_seq: usize) -> JournalResult<usize> {
         let snapshot = self.read()?;
-        let target = snapshot
+        if !snapshot
             .events
             .iter()
-            .find(|e| e.get("seq").and_then(Value::as_u64) == Some(target_seq as u64))
-            .ok_or_else(|| JournalError("target seq not found".into()))?;
+            .any(|e| e.get("seq").and_then(Value::as_u64) == Some(target_seq as u64))
+        {
+            return Err(JournalError("target seq not found".into()));
+        }
         // Count events after the target
         let superseded = snapshot
             .events
