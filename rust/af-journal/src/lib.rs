@@ -1387,7 +1387,7 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap()).unwrap();
             poisoned["sequence"] = json!(99);
             std::fs::write(
-                &journal.checkpoint_path(),
+                journal.checkpoint_path(),
                 serde_json::to_vec(&poisoned).unwrap(),
             )
             .unwrap();
