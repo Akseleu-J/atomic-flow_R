@@ -1250,13 +1250,25 @@ mod tests {
             let mut journal = make_journal(&home, "noreshash");
             for index in 0..50 {
                 journal
-                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .append(
+                        "user_input",
+                        &json!({"text": format!("t{index}")}),
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
             }
             let mut reopened = SessionJournal::open("noreshash").unwrap();
             for index in 0..20 {
                 reopened
-                    .append("user_input", &json!({"text": format!("n{index}")}), None, None, None)
+                    .append(
+                        "user_input",
+                        &json!({"text": format!("n{index}")}),
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
             }
             assert_eq!(
@@ -1268,18 +1280,26 @@ mod tests {
             // full revalidation, keep every event, and land its own event.
             let mut other = SessionJournal::open("noreshash").unwrap();
             other
-                .append("user_input", &json!({"text": "from-other"}), None, None, None)
+                .append(
+                    "user_input",
+                    &json!({"text": "from-other"}),
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
             reopened
                 .append("user_input", &json!({"text": "after"}), None, None, None)
                 .unwrap();
             let snapshot = reopened.read().unwrap();
             assert_eq!(snapshot.events.len(), 1 + 50 + 20 + 1 + 1);
-            assert_eq!(snapshot.events.last().unwrap()["payload"]["text"], json!("after"));
-            let checkpoint: Value = serde_json::from_slice(
-                &std::fs::read(reopened.checkpoint_path()).unwrap(),
-            )
-            .unwrap();
+            assert_eq!(
+                snapshot.events.last().unwrap()["payload"]["text"],
+                json!("after")
+            );
+            let checkpoint: Value =
+                serde_json::from_slice(&std::fs::read(reopened.checkpoint_path()).unwrap())
+                    .unwrap();
             assert_eq!(checkpoint["sequence"], json!(73));
         });
     }
@@ -1299,7 +1319,13 @@ mod tests {
             let mut other = SessionJournal::open("tailfind").unwrap();
             let sidecar = std::fs::read(reopened.checkpoint_path()).unwrap();
             other
-                .append("user_input", &json!({"text": "out-of-band"}), None, None, None)
+                .append(
+                    "user_input",
+                    &json!({"text": "out-of-band"}),
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap();
             std::fs::write(reopened.checkpoint_path(), &sidecar).unwrap();
             reopened
@@ -1348,12 +1374,17 @@ mod tests {
             let mut journal = make_journal(&home, "tripwire");
             for index in 0..3 {
                 journal
-                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .append(
+                        "user_input",
+                        &json!({"text": format!("t{index}")}),
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
             }
             let mut poisoned: Value =
-                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap())
-                    .unwrap();
+                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap()).unwrap();
             poisoned["sequence"] = json!(99);
             std::fs::write(
                 &journal.checkpoint_path(),
@@ -1366,8 +1397,7 @@ mod tests {
             let snapshot = journal.read().unwrap();
             assert_eq!(snapshot.events.len(), 5);
             let checkpoint: Value =
-                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap())
-                    .unwrap();
+                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap()).unwrap();
             assert_eq!(checkpoint["sequence"], json!(5), "sidecar is rewritten");
         });
     }
@@ -1379,7 +1409,13 @@ mod tests {
             let mut journal = make_journal(&home, "tamperwindow");
             for index in 0..3 {
                 journal
-                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .append(
+                        "user_input",
+                        &json!({"text": format!("t{index}")}),
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
             }
             // Same-length in-place edit of an old committed byte. The ADR-0003
