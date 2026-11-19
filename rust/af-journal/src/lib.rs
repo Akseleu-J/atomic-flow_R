@@ -201,6 +201,145 @@ fn now_unix() -> f64 {
         .as_secs_f64()
 }
 
+/// Incremental pending/unresolved-call state (P09-2): the exact observation
+/// semantics of the former per-snapshot recomputation, applied event by
+/// event so the host effect paths stay O(new bytes) instead of re-parsing
+/// the whole session before every model/tool effect.
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
+struct EffectLedger {
+    pending: BTreeMap<String, bool>,
+    charges: BTreeMap<String, ()>,
+    effects: BTreeMap<String, ()>,
+    unknown_charges: BTreeMap<String, ()>,
+    unknown_effects: BTreeMap<String, ()>,
+}
+
+impl EffectLedger {
+    fn apply(&mut self, event: &Value) {
+        let Some(call_id) = call_id_of(event) else {
+            return;
+        };
+        let kind = event["event_type"].as_str().unwrap_or_default();
+        let outcome = event
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "model_request" | "tool_request" => {
+                self.pending.insert(call_id.clone(), true);
+            }
+            "model_response" | "model_failed" | "tool_result" => {
+                self.pending.remove(&call_id);
+            }
+            "host_reconciliation" => {
+                self.pending.remove(&call_id);
+            }
+            _ => {}
+        }
+        match kind {
+            "model_request" => {
+                self.charges.insert(call_id, ());
+            }
+            "tool_request" => {
+                self.effects.insert(call_id, ());
+            }
+            "tool_effect_unknown" => {
+                self.effects.insert(call_id.clone(), ());
+                self.unknown_effects.insert(call_id, ());
+            }
+            "model_failed" => {
+                if outcome == "not_sent" || outcome == "refused" {
+                    if !self.unknown_charges.contains_key(&call_id) {
+                        self.charges.remove(&call_id);
+                    }
+                } else {
+                    self.charges.insert(call_id.clone(), ());
+                    self.unknown_charges.insert(call_id, ());
+                }
+            }
+            "model_response" => {
+                let cost = event.pointer("/payload/cost_usd").and_then(Value::as_f64);
+                match cost {
+                    Some(cost) if cost.is_finite() && cost >= 0.0 => {
+                        if !self.unknown_charges.contains_key(&call_id) {
+                            self.charges.remove(&call_id);
+                        }
+                    }
+                    _ => {
+                        self.charges.insert(call_id.clone(), ());
+                        self.unknown_charges.insert(call_id, ());
+                    }
+                }
+            }
+            "tool_result" => {
+                let mut uncertain = outcome == "unknown" || outcome == "pending";
+                if !uncertain {
+                    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+                    let mut candidates: Vec<&Value> = Vec::new();
+                    if let Some(result) = payload.get("result") {
+                        if result.is_object() {
+                            candidates.push(result);
+                        }
+                    }
+                    if let Some(call) = payload.get("call") {
+                        if let Some(summary) = call.get("result_summary") {
+                            if summary.is_object() {
+                                candidates.push(summary);
+                            }
+                        }
+                    }
+                    uncertain = candidates.iter().any(|item| {
+                        item.get("status").and_then(Value::as_str) == Some("rollback_failed")
+                            || item
+                                .get("side_effects_may_have_occurred")
+                                .is_some_and(|flag| {
+                                    !flag.is_boolean() || flag.as_bool() != Some(false)
+                                })
+                            || matches!(
+                                item.get("outcome").and_then(Value::as_str),
+                                Some("unknown") | Some("pending")
+                            )
+                    });
+                }
+                if uncertain {
+                    self.effects.insert(call_id.clone(), ());
+                    self.unknown_effects.insert(call_id, ());
+                } else if !self.unknown_effects.contains_key(&call_id) {
+                    self.effects.remove(&call_id);
+                }
+            }
+            "host_reconciliation" => {
+                let scope = event
+                    .pointer("/payload/scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if scope == "charge" {
+                    self.charges.remove(&call_id);
+                    self.unknown_charges.remove(&call_id);
+                } else {
+                    self.effects.remove(&call_id);
+                    self.unknown_effects.remove(&call_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Calls sent but never terminally observed.
+    fn pending_call_ids(&self) -> Vec<String> {
+        self.pending.keys().cloned().collect()
+    }
+
+    /// Closed transport observations do not establish settled charges/effects.
+    fn unresolved_call_ids(&self) -> Vec<String> {
+        let mut all: BTreeMap<String, ()> = BTreeMap::new();
+        for key in self.charges.keys().chain(self.effects.keys()) {
+            all.insert(key.clone(), ());
+        }
+        all.into_keys().collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub session_id: String,
@@ -212,135 +351,20 @@ pub struct SessionSnapshot {
 impl SessionSnapshot {
     /// Calls sent but never terminally observed.
     pub fn pending_call_ids(&self) -> Vec<String> {
-        let mut pending: BTreeMap<String, bool> = BTreeMap::new();
+        let mut ledger = EffectLedger::default();
         for event in &self.events {
-            let Some(call_id) = call_id_of(event) else {
-                continue;
-            };
-            match event["event_type"].as_str().unwrap_or_default() {
-                "model_request" | "tool_request" => {
-                    pending.insert(call_id, true);
-                }
-                "model_response" | "model_failed" | "tool_result" => {
-                    pending.remove(&call_id);
-                }
-                "host_reconciliation" => {
-                    pending.remove(&call_id);
-                }
-                _ => {}
-            }
+            ledger.apply(event);
         }
-        pending.into_keys().collect()
+        ledger.pending_call_ids()
     }
 
     /// Closed transport observations do not establish settled charges/effects.
     pub fn unresolved_call_ids(&self) -> Vec<String> {
-        let mut charges: BTreeMap<String, ()> = BTreeMap::new();
-        let mut effects: BTreeMap<String, ()> = BTreeMap::new();
-        let mut unknown_charges: BTreeMap<String, ()> = BTreeMap::new();
-        let mut unknown_effects: BTreeMap<String, ()> = BTreeMap::new();
+        let mut ledger = EffectLedger::default();
         for event in &self.events {
-            let Some(call_id) = call_id_of(event) else {
-                continue;
-            };
-            let kind = event["event_type"].as_str().unwrap_or_default();
-            let outcome = event
-                .get("outcome")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            match kind {
-                "model_request" => {
-                    charges.insert(call_id.clone(), ());
-                }
-                "tool_request" => {
-                    effects.insert(call_id.clone(), ());
-                }
-                "tool_effect_unknown" => {
-                    effects.insert(call_id.clone(), ());
-                    unknown_effects.insert(call_id.clone(), ());
-                }
-                "model_failed" => {
-                    if outcome == "not_sent" || outcome == "refused" {
-                        if !unknown_charges.contains_key(&call_id) {
-                            charges.remove(&call_id);
-                        }
-                    } else {
-                        charges.insert(call_id.clone(), ());
-                        unknown_charges.insert(call_id.clone(), ());
-                    }
-                }
-                "model_response" => {
-                    let cost = event.pointer("/payload/cost_usd").and_then(Value::as_f64);
-                    match cost {
-                        Some(cost) if cost.is_finite() && cost >= 0.0 => {
-                            if !unknown_charges.contains_key(&call_id) {
-                                charges.remove(&call_id);
-                            }
-                        }
-                        _ => {
-                            charges.insert(call_id.clone(), ());
-                            unknown_charges.insert(call_id.clone(), ());
-                        }
-                    }
-                }
-                "tool_result" => {
-                    let mut uncertain = outcome == "unknown" || outcome == "pending";
-                    if !uncertain {
-                        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-                        let mut candidates: Vec<&Value> = Vec::new();
-                        if let Some(result) = payload.get("result") {
-                            if result.is_object() {
-                                candidates.push(result);
-                            }
-                        }
-                        if let Some(call) = payload.get("call") {
-                            if let Some(summary) = call.get("result_summary") {
-                                if summary.is_object() {
-                                    candidates.push(summary);
-                                }
-                            }
-                        }
-                        uncertain = candidates.iter().any(|item| {
-                            item.get("status").and_then(Value::as_str) == Some("rollback_failed")
-                                || item
-                                    .get("side_effects_may_have_occurred")
-                                    .is_some_and(|flag| {
-                                        !flag.is_boolean() || flag.as_bool() != Some(false)
-                                    })
-                                || matches!(
-                                    item.get("outcome").and_then(Value::as_str),
-                                    Some("unknown") | Some("pending")
-                                )
-                        });
-                    }
-                    if uncertain {
-                        effects.insert(call_id.clone(), ());
-                        unknown_effects.insert(call_id.clone(), ());
-                    } else if !unknown_effects.contains_key(&call_id) {
-                        effects.remove(&call_id);
-                    }
-                }
-                "host_reconciliation" => {
-                    let scope = event
-                        .pointer("/payload/scope")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if scope == "charge" {
-                        charges.remove(&call_id);
-                        unknown_charges.remove(&call_id);
-                    } else {
-                        effects.remove(&call_id);
-                        unknown_effects.remove(&call_id);
-                    }
-                }
-                _ => {}
-            }
+            ledger.apply(event);
         }
-        let mut all: BTreeMap<String, ()> = BTreeMap::new();
-        for key in charges.keys().chain(effects.keys()) {
-            all.insert(key.clone(), ());
-        }
-        all.into_keys().collect()
+        ledger.unresolved_call_ids()
     }
 }
 
@@ -364,6 +388,13 @@ pub struct SessionJournal {
     /// stays 0 for appends that discover no foreign events — the
     /// deterministic O(1)-append proof.
     pub tail_bytes_scanned: u64,
+    /// Incremental pending/unresolved state over every validated event
+    /// (P09-2); rebuilt on full read, extended on append and on foreign-tail
+    /// discovery, so the effect paths stay O(new bytes).
+    ledger: EffectLedger,
+    /// An unterminated final line: it blocks appends and effects (P09-2
+    /// keeps the flag on the incremental state instead of a full re-read).
+    tail_present: bool,
 }
 
 impl SessionJournal {
@@ -373,14 +404,16 @@ impl SessionJournal {
 
     /// Refuse continuation while a durable effect checkpoint or unresolved
     /// request exists. Reading state never grants permission to replay it.
+    /// The O(new bytes) incremental state (P09-2) preserves the exact
+    /// fail-closed outcome of the former per-effect full re-read.
     pub fn require_effects_clear(&mut self) -> JournalResult<()> {
         if self.effect_path().exists() {
             return err(
                 "durable effect hold exists; explicit host reconciliation required, never replay",
             );
         }
-        let snapshot = self.read()?;
-        if snapshot.incomplete_tail || !snapshot.unresolved_call_ids().is_empty() {
+        self.refresh_state()?;
+        if self.tail_present || !self.ledger.unresolved_call_ids().is_empty() {
             return err("unresolved journal observations block new effects; never replay");
         }
         Ok(())
@@ -466,7 +499,8 @@ impl SessionJournal {
         if outcome == "unknown" {
             return Ok(());
         }
-        if !self.read()?.unresolved_call_ids().is_empty() {
+        self.refresh_state()?;
+        if !self.ledger.unresolved_call_ids().is_empty() {
             return err("terminal observation does not resolve the effect; durable hold retained");
         }
         std::fs::remove_file(&hold)
@@ -486,6 +520,8 @@ impl SessionJournal {
                 .join(format!("session_{session_id}.jsonl")),
             validated: None,
             tail_bytes_scanned: 0,
+            ledger: EffectLedger::default(),
+            tail_present: false,
         })
     }
 
@@ -639,6 +675,8 @@ impl SessionJournal {
         // resulting staleness into a full revalidation, never silent trust.
         let _ = self.write_checkpoint(sequence + 1, size + encoded.len() as u64, &hasher);
         self.validated = Some((sequence + 1, size + encoded.len() as u64, hasher));
+        self.ledger.apply(&event);
+        self.tail_present = false;
         Ok(event)
     }
 
@@ -734,30 +772,25 @@ impl SessionJournal {
         Ok(())
     }
 
-    /// Continue from the validated prefix without rehashing it (ADR-0003):
-    /// the initial full validation plus this process's own fsynced appends
-    /// pin the old bytes, and every full read (open, read, export) re-derives
-    /// the whole chain, so tampering stays evident. Only new tail bytes are
-    /// parsed per append; truncation is refused via the size guard, and a
-    /// checkpoint sidecar that disagrees with the continuation state forces
-    /// one full revalidation. This removes the per-append prefix rehash —
-    /// the P09 quadratic journal debt; segments.rs remains the long-session
-    /// substrate.
-    fn append_position(&mut self) -> JournalResult<(usize, u64, Sha256)> {
-        let Some((sequence, offset, known)) = self.validated.clone() else {
-            let snapshot = self.read()?;
-            if snapshot.incomplete_tail {
-                return err("session has an interrupted tail; call recover_tail() before appending; never replay pending calls");
-            }
-            return Ok(self.validated.clone().expect("read sets validated"));
-        };
+    /// O(new bytes) refresh of the incremental continuation state (ADR-0003
+    /// with P09-2): size/truncation guards, the checkpoint tripwire, foreign
+    /// tail discovery, and ledger application. An unterminated tail does not
+    /// error here — it sets tail_present and the caller enforces its own
+    /// fail-closed outcome (append refuses, effect paths block, full reads
+    /// tolerate the snapshot contract).
+    fn refresh_state(&mut self) -> JournalResult<()> {
+        if self.validated.is_none() {
+            self.read()?; // populates validated, ledger and tail_present
+            return Ok(());
+        }
+        let (sequence, offset, known) = self.validated.clone().expect("checked above");
         // Sidecar tripwire: a checkpoint that disagrees with the in-memory
         // continuation means out-of-band writes or a stale sidecar; one full
         // revalidation resolves it without trusting either side.
         if let Some((sidecar_sequence, sidecar_offset, _digest)) = self.load_checkpoint() {
             if sidecar_sequence != sequence || sidecar_offset != offset {
                 self.validated = None;
-                return self.append_position();
+                return self.refresh_state();
             }
         }
         let metadata = std::fs::metadata(&self.path)
@@ -791,18 +824,39 @@ impl SessionJournal {
                 return err("session event exceeds size limit");
             }
             if line.last() != Some(&b'\n') {
-                return err("session has an interrupted tail; call recover_tail() before appending; never replay pending calls");
+                self.tail_present = true;
+                break;
             }
             sequence += 1;
             let event: Value = serde_json::from_slice(&line).map_err(|error| {
                 JournalError(format!("invalid committed session event: {error}"))
             })?;
             self.validate_event(&event, sequence)?;
+            self.ledger.apply(&event);
             hasher.update(&line);
             offset += line.len() as u64;
         }
-        self.validated = Some((sequence, offset, hasher.clone()));
-        Ok((sequence, offset, hasher))
+        self.validated = Some((sequence, offset, hasher));
+        Ok(())
+    }
+
+    /// Continue from the validated prefix without rehashing it (ADR-0003):
+    /// the initial full validation plus this process's own fsynced appends
+    /// pin the old bytes, and every full read (open, read, export) re-derives
+    /// the whole chain, so tampering stays evident. Only new tail bytes are
+    /// parsed per append; truncation is refused via the size guard, and a
+    /// checkpoint sidecar that disagrees with the continuation state forces
+    /// one full revalidation. This removes the per-append prefix rehash —
+    /// the P09 quadratic journal debt; segments.rs remains the long-session
+    /// substrate.
+    fn append_position(&mut self) -> JournalResult<(usize, u64, Sha256)> {
+        self.refresh_state()?;
+        if self.tail_present {
+            return err(
+                "session has an interrupted tail; call recover_tail() before appending; never replay pending calls",
+            );
+        }
+        Ok(self.validated.clone().expect("refresh sets validated"))
     }
 
     pub fn read(&mut self) -> JournalResult<SessionSnapshot> {
@@ -818,6 +872,7 @@ impl SessionJournal {
         let mut fingerprint = Sha256::new();
         let sidecar = self.load_checkpoint();
         let mut sidecar_state: Option<Sha256> = None;
+        let mut ledger = EffectLedger::default();
         let mut file = std::fs::File::open(&self.path)
             .map_err(|error| JournalError(format!("session open failed: {error}")))?;
         let mut reader = std::io::BufReader::new(&mut file);
@@ -867,6 +922,7 @@ impl SessionJournal {
                 ))
             })?;
             self.validate_event(&event, sequence)?;
+            ledger.apply(&event);
             events.push(event);
             fingerprint.update(&line);
             complete_end += line.len() as u64;
@@ -880,6 +936,8 @@ impl SessionJournal {
             return err("session has no committed creation event");
         }
         self.verify_checkpoint(&sidecar, sidecar_state, events.len(), complete_end)?;
+        self.ledger = ledger;
+        self.tail_present = tail_bytes > 0;
         self.validated = Some((events.len(), complete_end, fingerprint));
         Ok(SessionSnapshot {
             session_id: self.session_id.clone(),
@@ -1440,6 +1498,68 @@ mod tests {
                 error.to_string().contains("identity/sequence mismatch"),
                 "full read detects the edit: {error}"
             );
+        });
+    }
+
+    #[test]
+    fn incremental_ledger_matches_full_rebuild_after_mixed_flow() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "ledgerflow");
+            let check = |journal: &mut SessionJournal| {
+                let incremental = journal.ledger.clone();
+                journal.read().unwrap();
+                assert_eq!(
+                    journal.ledger, incremental,
+                    "the incremental ledger must equal a full rebuild"
+                );
+            };
+            journal
+                .append("user_input", &json!({"text": "hi"}), None, None, None)
+                .unwrap();
+            check(&mut journal);
+            journal
+                .begin_effect("model_request", "call1", &json!({"model": "m"}))
+                .unwrap();
+            check(&mut journal);
+            journal
+                .finish_effect(
+                    "model_response",
+                    "call1",
+                    &json!({"cost_usd": 0.01}),
+                    "success",
+                )
+                .unwrap();
+            check(&mut journal);
+            journal
+                .begin_effect("tool_request", "call2", &json!({"name": "write"}))
+                .unwrap();
+            journal
+                .finish_effect(
+                    "tool_result",
+                    "call2",
+                    &json!({"result": {"status": "ok", "side_effects_may_have_occurred": false}}),
+                    "success",
+                )
+                .unwrap();
+            check(&mut journal);
+            journal
+                .begin_effect("tool_request", "call3", &json!({"name": "net"}))
+                .unwrap();
+            journal
+                .finish_effect("tool_result", "call3", &json!({}), "unknown")
+                .unwrap();
+            check(&mut journal);
+            // A foreign event without a call_id must not disturb the ledger.
+            let mut other = SessionJournal::open("ledgerflow").unwrap();
+            other
+                .append("user_input", &json!({"text": "foreign"}), None, None, None)
+                .unwrap();
+            check(&mut journal);
+            assert!(journal
+                .ledger
+                .unresolved_call_ids()
+                .contains(&"call3".to_string()));
         });
     }
 

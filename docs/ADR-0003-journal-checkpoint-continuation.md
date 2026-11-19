@@ -65,13 +65,22 @@ marked this explicitly as P09 debt.
 
 - Appends are O(new bytes) instead of O(session size); the 64 MiB session
   cap no longer makes late-session turns expensive.
+- **P09-2 (same ADR):** the per-effect `read()` in `begin_effect`/
+  `require_effects_clear`/`finish_effect` is replaced by
+  `refresh_state()` — the same O(new bytes) machinery (guards, tripwire,
+  foreign-tail discovery) extended with an incremental `EffectLedger`
+  (`pending`/`charges`/`effects`/`unknown_*`) applied per validated event.
+  The observation semantics are byte-for-byte the former per-snapshot
+  recomputation, which now delegates to the same `EffectLedger` (single
+  implementation, equivalence-pinned by a test that compares the
+  incremental ledger against a full rebuild after a mixed flow). An
+  unterminated tail sets a `tail_present` flag instead of erroring inside
+  the refresh, so each caller keeps its own fail-closed message: appends
+  refuse, `require_effects_clear` blocks with its replay warning,
+  `finish_effect` keeps the durable hold.
 - Cross-process continuation still validates the whole file once at
   `open()`; a cooperating writer's appends between our appends trigger one
   full revalidation (lease-serialized, so at most once per interleaving) —
   the realistic deployment is one owning process per session.
 - Legacy journals (no sidecar) work unchanged: the first append takes the
   existing full-read path and the sidecar appears after the first append.
-- The per-effect `read()` in `begin_effect`/`finish_effect` remains a full
-  validation per host effect; that is the next P09 sub-item (incremental
-  unresolved-ledger cache) and is intentionally not bundled here because its
-  fail-closed semantics deserve their own review.
