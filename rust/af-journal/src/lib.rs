@@ -359,6 +359,11 @@ pub struct SessionJournal {
     pub path: PathBuf,
     /// (last sequence, byte offset, running SHA-256 state over file[0..offset]).
     validated: Option<(usize, u64, Sha256)>,
+    /// Diagnostics: tail bytes parsed since open. The validated prefix is
+    /// never rehashed after the initial full validation (ADR-0003), so this
+    /// stays 0 for appends that discover no foreign events — the
+    /// deterministic O(1)-append proof.
+    pub tail_bytes_scanned: u64,
 }
 
 impl SessionJournal {
@@ -480,6 +485,7 @@ impl SessionJournal {
                 .join("sessions")
                 .join(format!("session_{session_id}.jsonl")),
             validated: None,
+            tail_bytes_scanned: 0,
         })
     }
 
@@ -628,14 +634,115 @@ impl SessionJournal {
             .and_then(|_| file.sync_all())
             .map_err(|error| JournalError(format!("session fsync failed: {error}")))?;
         hasher.update(&encoded);
+        // The sidecar is written after the durable append; a failed write is
+        // deliberately non-fatal — the next append's tripwire converts any
+        // resulting staleness into a full revalidation, never silent trust.
+        let _ = self.write_checkpoint(sequence + 1, size + encoded.len() as u64, &hasher);
         self.validated = Some((sequence + 1, size + encoded.len() as u64, hasher));
         Ok(event)
     }
 
-    /// Validate new records only; rehash the prefix to detect any old-byte
-    /// edit. A stat-only cache would miss same-size/mtime tampering. This
-    /// deliberately retains linear byte hashing per append until a
-    /// transactional store exists (P09 debt, preserved for parity).
+    fn checkpoint_path(&self) -> PathBuf {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session.jsonl");
+        self.path.with_file_name(format!("{name}.checkpoint"))
+    }
+
+    /// Durable continuation summary for the next append (ADR-0003): written
+    /// atomically after every fsynced append. An accelerator and tripwire,
+    /// never a correctness authority.
+    fn write_checkpoint(&self, sequence: usize, offset: u64, hasher: &Sha256) -> JournalResult<()> {
+        let record = json!({
+            "schema_version": 1,
+            "session_id": self.session_id,
+            "sequence": sequence,
+            "offset": offset,
+            "prefix_sha256": format!("{:x}", hasher.clone().finalize()),
+        });
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| JournalError(format!("checkpoint encode failed: {error}")))?;
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session.jsonl");
+        let tmp = self.path.with_file_name(format!("{name}.checkpoint.tmp"));
+        let target = self.checkpoint_path();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|error| JournalError(format!("checkpoint sidecar write failed: {error}")))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| JournalError(format!("checkpoint fsync failed: {error}")))?;
+        drop(file);
+        std::fs::rename(&tmp, &target)
+            .map_err(|error| JournalError(format!("checkpoint rename failed: {error}")))?;
+        sync_parent(&target)
+    }
+
+    /// (sequence, offset, prefix digest) recorded in the sidecar, if it is
+    /// readable. A missing or corrupt sidecar yields None: no tripwire,
+    /// in-memory continuation stays the baseline trust.
+    fn load_checkpoint(&self) -> Option<(usize, u64, String)> {
+        let raw = std::fs::read(self.checkpoint_path()).ok()?;
+        let value: Value = serde_json::from_slice(&raw).ok()?;
+        let sequence = value.get("sequence")?.as_u64()? as usize;
+        let offset = value.get("offset")?.as_u64()?;
+        let digest = value.get("prefix_sha256")?.as_str()?.to_string();
+        Some((sequence, offset, digest))
+    }
+
+    /// Anchor check (ADR-0003): the durable checkpoint pins the exact bytes
+    /// of the prefix it recorded, so same-length edits of committed bytes
+    /// are tamper-evident at every full read. A sidecar inconsistent with
+    /// the recomputed state is treated as corrupt and skipped — the sidecar
+    /// is an accelerator and evidence anchor, never a correctness authority
+    /// that can brick reads.
+    fn verify_checkpoint(
+        &self,
+        sidecar: &Option<(usize, u64, String)>,
+        sidecar_state: Option<Sha256>,
+        events_len: usize,
+        complete_end: u64,
+    ) -> JournalResult<()> {
+        let Some((sequence, offset, digest)) = sidecar else {
+            return Ok(());
+        };
+        if *offset > complete_end {
+            return err(
+                "session is shorter than its durable checkpoint; inspect integrity before continuing",
+            );
+        }
+        if *sequence > events_len || *offset == 0 {
+            return Ok(());
+        }
+        let Some(state) = sidecar_state else {
+            return Ok(());
+        };
+        let actual = format!("{:x}", state.finalize());
+        if actual != *digest {
+            return err(
+                "committed session bytes changed since the last checkpoint; inspect integrity before appending",
+            );
+        }
+        Ok(())
+    }
+
+    /// Continue from the validated prefix without rehashing it (ADR-0003):
+    /// the initial full validation plus this process's own fsynced appends
+    /// pin the old bytes, and every full read (open, read, export) re-derives
+    /// the whole chain, so tampering stays evident. Only new tail bytes are
+    /// parsed per append; truncation is refused via the size guard, and a
+    /// checkpoint sidecar that disagrees with the continuation state forces
+    /// one full revalidation. This removes the per-append prefix rehash —
+    /// the P09 quadratic journal debt; segments.rs remains the long-session
+    /// substrate.
     fn append_position(&mut self) -> JournalResult<(usize, u64, Sha256)> {
         let Some((sequence, offset, known)) = self.validated.clone() else {
             let snapshot = self.read()?;
@@ -644,36 +751,32 @@ impl SessionJournal {
             }
             return Ok(self.validated.clone().expect("read sets validated"));
         };
+        // Sidecar tripwire: a checkpoint that disagrees with the in-memory
+        // continuation means out-of-band writes or a stale sidecar; one full
+        // revalidation resolves it without trusting either side.
+        if let Some((sidecar_sequence, sidecar_offset, _digest)) = self.load_checkpoint() {
+            if sidecar_sequence != sequence || sidecar_offset != offset {
+                self.validated = None;
+                return self.append_position();
+            }
+        }
         let metadata = std::fs::metadata(&self.path)
             .map_err(|error| JournalError(format!("session stat failed: {error}")))?;
         if metadata.len() > MAX_SESSION_BYTES {
             return err("session exceeds 64 MiB; inspect it offline");
         }
-        let mut file = std::fs::File::open(&self.path)
-            .map_err(|error| JournalError(format!("session open failed: {error}")))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| JournalError(format!("session seek failed: {error}")))?;
-        let mut hasher = Sha256::new();
-        let mut remaining = offset;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        while remaining > 0 {
-            let chunk = buffer.len().min(remaining as usize);
-            let read = file
-                .read(&mut buffer[..chunk])
-                .map_err(|error| JournalError(format!("session read failed: {error}")))?;
-            if read == 0 {
-                return err("validated session prefix was truncated");
-            }
-            hasher.update(&buffer[..read]);
-            remaining -= read as u64;
+        if metadata.len() < offset {
+            return err(
+                "validated session prefix was truncated; inspect integrity before appending",
+            );
         }
-        // The recomputed prefix digest must equal the digest recorded when
-        // these bytes were validated; anything else is tampering.
-        if hasher.clone().finalize().to_vec() != known.clone().finalize().to_vec() {
-            return err("validated session prefix changed; inspect integrity before appending");
-        }
+        let mut hasher = known;
         let mut sequence = sequence;
         let mut offset = offset;
+        let mut file = std::fs::File::open(&self.path)
+            .map_err(|error| JournalError(format!("session open failed: {error}")))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| JournalError(format!("session seek failed: {error}")))?;
         let mut reader = std::io::BufReader::new(file);
         loop {
             let mut line = Vec::new();
@@ -683,6 +786,7 @@ impl SessionJournal {
             if read == 0 {
                 break;
             }
+            self.tail_bytes_scanned += line.len() as u64;
             if line.len() > MAX_EVENT_BYTES {
                 return err("session event exceeds size limit");
             }
@@ -712,6 +816,8 @@ impl SessionJournal {
         let mut complete_end: u64 = 0;
         let mut tail_bytes: usize = 0;
         let mut fingerprint = Sha256::new();
+        let sidecar = self.load_checkpoint();
+        let mut sidecar_state: Option<Sha256> = None;
         let mut file = std::fs::File::open(&self.path)
             .map_err(|error| JournalError(format!("session open failed: {error}")))?;
         let mut reader = std::io::BufReader::new(&mut file);
@@ -764,10 +870,16 @@ impl SessionJournal {
             events.push(event);
             fingerprint.update(&line);
             complete_end += line.len() as u64;
+            // Capture the chain state exactly at the checkpointed boundary so
+            // the recorded digest can be re-derived without a second pass.
+            if sidecar.as_ref().map(|(_, offset, _)| *offset) == Some(complete_end) {
+                sidecar_state = Some(fingerprint.clone());
+            }
         }
         if events.is_empty() || events[0]["event_type"] != json!("session_created") {
             return err("session has no committed creation event");
         }
+        self.verify_checkpoint(&sidecar, sidecar_state, events.len(), complete_end)?;
         self.validated = Some((events.len(), complete_end, fingerprint));
         Ok(SessionSnapshot {
             session_id: self.session_id.clone(),
@@ -1132,6 +1244,170 @@ mod tests {
     }
 
     #[test]
+    fn appends_do_not_rehash_the_validated_prefix() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "noreshash");
+            for index in 0..50 {
+                journal
+                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .unwrap();
+            }
+            let mut reopened = SessionJournal::open("noreshash").unwrap();
+            for index in 0..20 {
+                reopened
+                    .append("user_input", &json!({"text": format!("n{index}")}), None, None, None)
+                    .unwrap();
+            }
+            assert_eq!(
+                reopened.tail_bytes_scanned, 0,
+                "own appends never rehash the prefix nor rescan committed bytes"
+            );
+            // A cooperating writer appends out-of-band and refreshes the
+            // sidecar: the stale in-memory continuation must tripwire into a
+            // full revalidation, keep every event, and land its own event.
+            let mut other = SessionJournal::open("noreshash").unwrap();
+            other
+                .append("user_input", &json!({"text": "from-other"}), None, None, None)
+                .unwrap();
+            reopened
+                .append("user_input", &json!({"text": "after"}), None, None, None)
+                .unwrap();
+            let snapshot = reopened.read().unwrap();
+            assert_eq!(snapshot.events.len(), 1 + 50 + 20 + 1 + 1);
+            assert_eq!(snapshot.events.last().unwrap()["payload"]["text"], json!("after"));
+            let checkpoint: Value = serde_json::from_slice(
+                &std::fs::read(reopened.checkpoint_path()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(checkpoint["sequence"], json!(73));
+        });
+    }
+
+    #[test]
+    fn foreign_tail_is_discovered_without_rehash() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "tailfind");
+            journal
+                .append("user_input", &json!({"text": "first"}), None, None, None)
+                .unwrap();
+            let mut reopened = SessionJournal::open("tailfind").unwrap();
+            // Simulate a crash after the durable append but before the
+            // sidecar refresh: the file gains a foreign event while the
+            // sidecar still matches the reader's in-memory state.
+            let mut other = SessionJournal::open("tailfind").unwrap();
+            let sidecar = std::fs::read(reopened.checkpoint_path()).unwrap();
+            other
+                .append("user_input", &json!({"text": "out-of-band"}), None, None, None)
+                .unwrap();
+            std::fs::write(reopened.checkpoint_path(), &sidecar).unwrap();
+            reopened
+                .append("user_input", &json!({"text": "mine"}), None, None, None)
+                .unwrap();
+            assert!(
+                reopened.tail_bytes_scanned > 0,
+                "the foreign event is discovered by the tail loop, not clobbered"
+            );
+            let snapshot = reopened.read().unwrap();
+            assert_eq!(snapshot.events.len(), 4);
+            assert_eq!(snapshot.events[2]["payload"]["text"], json!("out-of-band"));
+            assert_eq!(snapshot.events[3]["payload"]["text"], json!("mine"));
+        });
+    }
+
+    #[test]
+    fn truncated_validated_prefix_refuses_to_append() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "truncategate");
+            journal
+                .append("user_input", &json!({"text": "hello"}), None, None, None)
+                .unwrap();
+            let metadata = std::fs::metadata(&journal.path).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&journal.path)
+                .unwrap();
+            file.set_len(metadata.len() / 2).unwrap();
+            drop(file);
+            let error = journal
+                .append("user_input", &json!({"text": "after"}), None, None, None)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("truncated"),
+                "truncation of validated bytes must refuse the append: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn sidecar_disagreement_forces_full_revalidation() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "tripwire");
+            for index in 0..3 {
+                journal
+                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .unwrap();
+            }
+            let mut poisoned: Value =
+                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap())
+                    .unwrap();
+            poisoned["sequence"] = json!(99);
+            std::fs::write(
+                &journal.checkpoint_path(),
+                serde_json::to_vec(&poisoned).unwrap(),
+            )
+            .unwrap();
+            journal
+                .append("user_input", &json!({"text": "after"}), None, None, None)
+                .unwrap();
+            let snapshot = journal.read().unwrap();
+            assert_eq!(snapshot.events.len(), 5);
+            let checkpoint: Value =
+                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap())
+                    .unwrap();
+            assert_eq!(checkpoint["sequence"], json!(5), "sidecar is rewritten");
+        });
+    }
+
+    #[test]
+    fn same_size_prefix_edit_stays_tamper_evident_at_full_read() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "tamperwindow");
+            for index in 0..3 {
+                journal
+                    .append("user_input", &json!({"text": format!("t{index}")}), None, None, None)
+                    .unwrap();
+            }
+            // Same-length in-place edit of an old committed byte. The ADR-0003
+            // per-append window means this append is not refused; any full
+            // read must still reject the broken chain.
+            let mut bytes = std::fs::read(&journal.path).unwrap();
+            let marker = b"\"sequence\":2";
+            let position = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("event 2 sequence marker");
+            bytes[position + marker.len() - 1] = b'9';
+            std::fs::write(&journal.path, &bytes).unwrap();
+            journal
+                .append("user_input", &json!({"text": "after"}), None, None, None)
+                .unwrap();
+            let error = match SessionJournal::open("tamperwindow") {
+                Err(error) => error,
+                Ok(_) => panic!("full read must detect the same-size edit"),
+            };
+            assert!(
+                error.to_string().contains("identity/sequence mismatch"),
+                "full read detects the edit: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn durable_effect_checkpoint_prevents_replay_until_successful_terminal_ack() {
         let home = temp_home();
         with_env(&home, || {
@@ -1405,26 +1681,35 @@ mod tests {
     }
 
     #[test]
-    fn tampered_prefix_is_detected_on_append() {
+    fn tampered_committed_bytes_are_tamper_evident_at_full_read() {
         let home = temp_home();
         with_env(&home, || {
             let mut journal = make_journal(&home, "tamper");
             journal
                 .append("user_input", &json!({"text": "original"}), None, None, None)
                 .unwrap();
-            // Out-of-band rewrite of committed bytes.
+            // Out-of-band same-length rewrite of committed payload bytes that
+            // keeps the event structure valid.
             let path = user_dir().join("sessions").join("session_tamper.jsonl");
-            let bytes = std::fs::read(&path).unwrap();
-            let poisoned: Vec<u8> = bytes
-                .iter()
-                .map(|b| if *b == b'o' { b'0' } else { *b })
-                .collect();
-            std::fs::write(&path, &poisoned).unwrap();
-            let error = journal
-                .append("user_input", &json!({}), None, None, None)
-                .unwrap_err();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let marker = b"\"original\"";
+            let position = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("payload marker");
+            bytes[position + 1] = b'0'; // "0riginal": same length, still valid JSON
+            std::fs::write(&path, &bytes).unwrap();
+            // The per-append window (ADR-0003): appends do not rehash the
+            // validated prefix, so this append is not refused. The tampering
+            // is caught by the next full read, which re-derives the chain
+            // against the durable checkpoint digest.
+            let error = match SessionJournal::open("tamper") {
+                Err(error) => error,
+                Ok(_) => panic!("full read must detect the same-size content edit"),
+            };
             assert!(
-                error.0.contains("changed") || error.0.contains("invalid committed session event")
+                error.0.contains("changed"),
+                "checkpoint anchor must flag the edit: {error}"
             );
         });
     }
