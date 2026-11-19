@@ -501,21 +501,7 @@ fn run(command: Command) -> Result<String, String> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            match beta_gate::GateConfig::from_env() {
-                None => Ok("beta gate: disabled (dev build without a pinned issuer key)".into()),
-                Some(config) => match beta_gate::check(&config, now_secs) {
-                    Ok(beta_gate::GateOutcome::Active { expires_in_secs }) => Ok(format!(
-                        "beta access: ACTIVE, {}h {}m remaining (grant {})",
-                        expires_in_secs / 3600,
-                        (expires_in_secs % 3600) / 60,
-                        config.grant_id
-                    )),
-                    Ok(beta_gate::GateOutcome::Refused(message)) => {
-                        Ok(format!("beta access: REFUSED - {message}"))
-                    }
-                    Err(error) => Ok(format!("beta access: UNAVAILABLE - {error}")),
-                },
-            }
+            Ok(beta_gate::status_report(now_secs))
         }
         Command::Init { budget_cap_usd } => {
             let report = init_wizard::run(budget_cap_usd.as_deref())?;

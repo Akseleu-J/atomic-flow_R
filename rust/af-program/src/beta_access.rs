@@ -27,6 +27,14 @@ impl AccessDecision {
     pub fn expires_at(&self) -> u64 {
         self.expires_at
     }
+
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub fn release_id(&self) -> &str {
+        &self.release_id
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

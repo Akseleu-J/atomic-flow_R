@@ -177,7 +177,11 @@ fn decision_provenance(body: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
-pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), String> {
+/// Verify the signed pass envelope file and return the trusted decision.
+pub fn verify_pass_file(
+    pass_path: &std::path::Path,
+    now: u64,
+) -> Result<af_program::beta_access::AccessDecision, String> {
     let text =
         std::fs::read_to_string(pass_path).map_err(|e| format!("beta pass read failed: {e}"))?;
     let pass: Value =
@@ -205,7 +209,7 @@ pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), St
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let _decision = af_program::beta_access::verify_offline_pass(
+    af_program::beta_access::verify_offline_pass(
         &issuer_key,
         &body,
         &signature,
@@ -218,8 +222,45 @@ pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), St
             "beta access expired - the pass window has closed".to_string()
         }
         _ => "beta pass is invalid (wrong grant/release or tampered)".to_string(),
-    })?;
-    Ok(())
+    })
+}
+
+pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), String> {
+    verify_pass_file(pass_path, now).map(|_| ())
+}
+
+/// `af beta`: the offline pass first (the pivot made it the primary access
+/// channel), then the online service, then the honest dev-build message.
+pub fn status_report(now: u64) -> String {
+    let pass_file = af_sandbox::user_dir().join(OFFLINE_PASS_FILE);
+    if pass_file.exists() {
+        return match verify_pass_file(&pass_file, now) {
+            Ok(decision) => {
+                let remaining = decision.expires_at().saturating_sub(now);
+                format!(
+                    "beta pass: ACTIVE, {}h {}m remaining (grant {}, release {})",
+                    remaining / 3600,
+                    (remaining % 3600) / 60,
+                    decision.grant_id(),
+                    decision.release_id()
+                )
+            }
+            Err(message) => format!("beta pass: {message}"),
+        };
+    }
+    match GateConfig::from_env() {
+        None => "beta gate: disabled (dev build without a pinned issuer key)".into(),
+        Some(config) => match check(&config, now) {
+            Ok(GateOutcome::Active { expires_in_secs }) => format!(
+                "beta access: ACTIVE, {}h {}m remaining (grant {})",
+                expires_in_secs / 3600,
+                (expires_in_secs % 3600) / 60,
+                config.grant_id
+            ),
+            Ok(GateOutcome::Refused(message)) => format!("beta access: REFUSED - {message}"),
+            Err(error) => format!("beta access: UNAVAILABLE - {error}"),
+        },
+    }
 }
 
 pub fn gate_new_operation(now: u64) -> Result<(), String> {
