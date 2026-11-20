@@ -772,6 +772,59 @@ impl SessionJournal {
         Ok(())
     }
 
+    /// Bounded, read-only health report for operator diagnostics (P09).
+    /// Never mutates the journal bytes; the in-memory continuation state may
+    /// advance (guards, tripwire, tail scan) exactly as it would before an
+    /// append. Failures are reported as fields, never propagated — a broken
+    /// session must still produce a report. With `verify`, the whole chain
+    /// is re-derived once (the full-read tamper-evidence pass).
+    pub fn diagnostics(&mut self, verify: bool) -> JournalResult<Value> {
+        let metadata = std::fs::metadata(&self.path)
+            .map_err(|error| JournalError(format!("session stat failed: {error}")))?;
+        let mut report = json!({
+            "schema": "atomic-flow/journal-diagnostics/v1",
+            "session_id": self.session_id,
+            "path": self.path.to_string_lossy(),
+            "file_bytes": metadata.len(),
+        });
+        if let Err(error) = self.refresh_state() {
+            report["refresh_error"] = json!(error.to_string());
+        }
+        let sidecar = self.load_checkpoint();
+        let (state_sequence, state_offset) = match self.validated {
+            Some((sequence, offset, _)) => (sequence, offset),
+            None => (0, 0),
+        };
+        report["state"] = json!({
+            "sequence": state_sequence,
+            "offset": state_offset,
+            "tail_present": self.tail_present,
+            "tail_bytes_scanned": self.tail_bytes_scanned,
+            "pending": self.ledger.pending_call_ids().len(),
+            "unresolved": self.ledger.unresolved_call_ids(),
+        });
+        report["checkpoint"] = json!({
+            "present": sidecar.is_some(),
+            "sequence": sidecar.as_ref().map(|(sequence, _, _)| *sequence),
+            "offset": sidecar.as_ref().map(|(_, offset, _)| *offset),
+            "matches_state": sidecar
+                .as_ref()
+                .is_none_or(|(sequence, offset, _)| *sequence == state_sequence
+                    && *offset == state_offset),
+        });
+        if verify {
+            report["integrity"] = match self.read() {
+                Ok(snapshot) => json!({
+                    "verified": true,
+                    "events": snapshot.events.len(),
+                    "incomplete_tail": snapshot.incomplete_tail,
+                }),
+                Err(error) => json!({"verified": false, "error": error.to_string()}),
+            };
+        }
+        Ok(report)
+    }
+
     /// O(new bytes) refresh of the incremental continuation state (ADR-0003
     /// with P09-2): size/truncation guards, the checkpoint tripwire, foreign
     /// tail discovery, and ledger application. An unterminated tail does not
@@ -1560,6 +1613,68 @@ mod tests {
                 .ledger
                 .unresolved_call_ids()
                 .contains(&"call3".to_string()));
+        });
+    }
+
+    #[test]
+    fn diagnostics_reports_state_checkpoint_and_integrity() {
+        let home = temp_home();
+        with_env(&home, || {
+            let mut journal = make_journal(&home, "diagflow");
+            journal
+                .append("user_input", &json!({"text": "hello"}), None, None, None)
+                .unwrap();
+            let report = journal.diagnostics(false).unwrap();
+            assert_eq!(
+                report["schema"],
+                json!("atomic-flow/journal-diagnostics/v1")
+            );
+            assert_eq!(report["state"]["sequence"], json!(2));
+            assert_eq!(report["state"]["tail_present"], json!(false));
+            assert_eq!(report["checkpoint"]["present"], json!(true));
+            assert_eq!(report["checkpoint"]["matches_state"], json!(true));
+            assert!(report.get("refresh_error").is_none());
+            assert!(report.get("integrity").is_none());
+
+            // The verify pass re-derives the whole chain once.
+            let verified = journal.diagnostics(true).unwrap();
+            assert_eq!(verified["integrity"]["verified"], json!(true));
+            assert_eq!(verified["integrity"]["events"], json!(2));
+
+            // A sidecar that disagrees shows up as a mismatch, not a crash.
+            let poisoned: Value =
+                serde_json::from_slice(&std::fs::read(journal.checkpoint_path()).unwrap()).unwrap();
+            let mut poisoned = poisoned;
+            poisoned["sequence"] = json!(42);
+            std::fs::write(
+                journal.checkpoint_path(),
+                serde_json::to_vec(&poisoned).unwrap(),
+            )
+            .unwrap();
+            let mismatch = journal.diagnostics(false).unwrap();
+            assert_eq!(mismatch["checkpoint"]["matches_state"], json!(false));
+            assert!(mismatch.get("refresh_error").is_none());
+
+            // An honest append restores the sidecar to the true state.
+            journal
+                .append("user_input", &json!({"text": "more"}), None, None, None)
+                .unwrap();
+
+            // A same-size content edit is caught by the verify pass only.
+            let mut bytes = std::fs::read(&journal.path).unwrap();
+            let marker = b"\"hello\"";
+            let position = bytes
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("payload marker");
+            bytes[position + 1] = b'H'; // "Hello": same length, still valid JSON
+            std::fs::write(&journal.path, &bytes).unwrap();
+            let tampered = journal.diagnostics(true).unwrap();
+            assert_eq!(tampered["integrity"]["verified"], json!(false));
+            assert!(tampered["integrity"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed"));
         });
     }
 

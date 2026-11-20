@@ -100,6 +100,87 @@ pub fn run_checks() -> Value {
         json!({"path": graphs_dir.to_string_lossy(), "exists": graphs_dir.is_dir()}),
     );
 
+    // Journal health (P09): quick diagnostics on the newest sessions plus
+    // one full-chain verify of the newest one. Structural problems (an
+    // interrupted tail, a checkpoint that disagrees with the journal state,
+    // a failed chain verification) fail the check; pending/unresolved call
+    // ledgers are informational and never fail it.
+    let mut sessions = Vec::new();
+    let mut journal_ok = true;
+    let mut newest: Option<String> = None;
+    match af_journal::list_sessions(8) {
+        Ok(entries) => {
+            for entry in entries {
+                let Some(session_id) = entry.get("session_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if newest.is_none() {
+                    newest = Some(session_id.to_string());
+                }
+                match af_journal::SessionJournal::open(session_id) {
+                    Ok(mut journal) => match journal.diagnostics(false) {
+                        Ok(report) => {
+                            let healthy = report["state"]["tail_present"] == json!(false)
+                                && report["checkpoint"]["matches_state"] == json!(true)
+                                && report.get("refresh_error").is_none();
+                            if !healthy {
+                                journal_ok = false;
+                            }
+                            sessions.push(json!({
+                                "session_id": session_id,
+                                "ok": healthy,
+                                "state": report["state"],
+                                "checkpoint": report["checkpoint"],
+                                "refresh_error": report.get("refresh_error"),
+                            }));
+                        }
+                        Err(error) => {
+                            journal_ok = false;
+                            sessions.push(json!({
+                                "session_id": session_id,
+                                "ok": false,
+                                "error": error.to_string(),
+                            }));
+                        }
+                    },
+                    Err(error) => {
+                        journal_ok = false;
+                        sessions.push(json!({
+                            "session_id": session_id,
+                            "ok": false,
+                            "error": error.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            journal_ok = false;
+            sessions.push(json!({"error": error.to_string()}));
+        }
+    }
+    let mut verify_detail = json!({"verified": null, "reason": "no sessions"});
+    if let Some(session_id) = newest {
+        match af_journal::SessionJournal::open(&session_id) {
+            Ok(mut journal) => match journal.diagnostics(true) {
+                Ok(report) => verify_detail = report["integrity"].clone(),
+                Err(error) => {
+                    verify_detail = json!({"verified": false, "error": error.to_string()});
+                    journal_ok = false;
+                }
+            },
+            Err(error) => {
+                verify_detail = json!({"verified": false, "error": error.to_string()});
+                journal_ok = false;
+            }
+        }
+    }
+    check(
+        "journal_health",
+        journal_ok,
+        json!({"sessions": sessions, "newest_verify": verify_detail}),
+    );
+
     json!({
         "ok": checks.iter().all(|check| check["ok"] == json!(true)),
         "checks": checks,
