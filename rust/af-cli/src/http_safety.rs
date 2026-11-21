@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-fn authority(value: &str, port: u16, token_mode: bool) -> bool {
+fn authority(value: &str, port: u16, allow_remote_host: bool) -> bool {
     if value.len() > 255 || value.contains(['@', '/', '\\', '?', '#', ' ', '\t', '\r', '\n']) {
         return false;
     }
@@ -27,18 +27,19 @@ fn authority(value: &str, port: u16, token_mode: bool) -> bool {
             })
             .flatten()
     });
-    address
-        .is_some_and(|address| address.port() == port && (token_mode || address.ip().is_loopback()))
+    address.is_some_and(|address| {
+        address.port() == port && (allow_remote_host || address.ip().is_loopback())
+    })
 }
 
-pub(super) fn request_allowed(headers: &HeaderMap, port: u16, token_mode: bool) -> bool {
+pub(super) fn request_allowed(headers: &HeaderMap, port: u16, allow_remote_host: bool) -> bool {
     if headers.get_all("host").iter().count() != 1 || headers.get_all("origin").iter().count() > 1 {
         return false;
     }
     let Some(host) = headers.get("host").and_then(|value| value.to_str().ok()) else {
         return false;
     };
-    if !authority(host, port, token_mode) {
+    if !authority(host, port, allow_remote_host) {
         return false;
     }
     if let Some(site) = headers.get("sec-fetch-site") {
@@ -74,7 +75,7 @@ pub(super) async fn guard(
             .is_none_or(|host| !uri_authority.as_str().eq_ignore_ascii_case(host))
     });
     if mismatched_authority
-        || !request_allowed(request.headers(), state.port, state.token.is_some())
+        || !request_allowed(request.headers(), state.port, state.allow_remote_host)
     {
         return (
             StatusCode::FORBIDDEN,

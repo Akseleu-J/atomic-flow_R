@@ -30,9 +30,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          profile: minimal
+      - name: Install the pinned Rust toolchain
+        working-directory: rust
+        run: rustup install --no-self-update
       - name: Linux native folder-picker build dependency
         if: runner.os == 'Linux'
         run: |
@@ -43,8 +43,8 @@ jobs:
         run: |
           mkdir -p validation/rust
           git rev-parse HEAD > validation/rust/commit.txt
-          rustc --version --verbose > validation/rust/rustc.txt
-          cargo --version > validation/rust/cargo.txt
+          (cd rust && rustc --version --verbose) > validation/rust/rustc.txt
+          (cd rust && cargo --version) > validation/rust/cargo.txt
           python validation/production-20261104/capture_source.py validation/rust/source.json
       - name: cargo test (single job, no incremental; 3.4 GiB-host parity flags)
         shell: bash

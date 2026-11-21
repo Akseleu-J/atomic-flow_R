@@ -24,9 +24,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          profile: minimal
+      - name: Install the pinned Rust toolchain
+        working-directory: rust
+        run: rustup install --no-self-update
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.11'
@@ -43,8 +43,8 @@ jobs:
         run: |
           mkdir -p validation/studio-ci
           git rev-parse HEAD > validation/studio-ci/commit.txt
-          rustc --version --verbose > validation/studio-ci/rustc.txt
-          cargo --version > validation/studio-ci/cargo.txt
+          (cd rust && rustc --version --verbose) > validation/studio-ci/rustc.txt
+          (cd rust && cargo --version) > validation/studio-ci/cargo.txt
           python validation/production-20261104/capture_source.py validation/studio-ci/source.json
       - name: Validate complete production planning registry
         shell: bash

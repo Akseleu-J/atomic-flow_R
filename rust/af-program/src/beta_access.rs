@@ -69,17 +69,14 @@ impl Challenge {
     }
 }
 
-/// Offline pass verification: no service, no challenge, no freshness.
-/// A signed pass file (issued once, emailed to the participant) is checked
-/// against the pinned issuer public key and the local clock. Clock rollback
-/// cannot be defeated offline — this is the accepted trade-off for the
-/// self-hosted beta (owner decision 17.11).
-pub fn verify_offline_pass(
+/// Authenticate an offline pass and validate its signed activation window.
+/// An authenticated pass may have expired. The caller must check expires_at
+/// against its effective clock before authorizing any operation.
+pub fn authenticate_offline_pass(
     issuer_key: &[u8; 32],
     body: &[u8],
     signature: &[u8; 64],
-    expected_grant: &str,
-    expected_release: &str,
+    expected_release: Option<&str>,
     now: u64,
 ) -> Result<AccessDecision, AccessError> {
     if body.len() > MAX_RESPONSE_BYTES {
@@ -94,15 +91,15 @@ pub fn verify_offline_pass(
     if decision.schema_version != 1
         || !identifier(&decision.grant_id)
         || !identifier(&decision.release_id)
-        || decision.grant_id != expected_grant
-        || decision.release_id != expected_release
+        || expected_release.is_some_and(|release| decision.release_id != release)
+        || now < decision.activated_at
         || decision.activated_at > decision.checked_at
         || !(1..=MAX_BETA_SECONDS)
             .contains(&decision.expires_at.saturating_sub(decision.activated_at))
     {
         return Err(AccessError::Invalid);
     }
-    if !decision.active || now >= decision.expires_at {
+    if !decision.active {
         return Err(AccessError::Inactive);
     }
     Ok(decision)
@@ -195,6 +192,31 @@ mod tests {
         assert_eq!(call(&bytes(&body), 110).unwrap_err(), AccessError::Inactive);
         body["expires_at"] = json!(101 + MAX_BETA_SECONDS);
         assert_eq!(call(&bytes(&body), 110).unwrap_err(), AccessError::Invalid);
+    }
+
+    #[test]
+    fn offline_pass_uses_signed_grant_and_the_build_release() {
+        let key = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "schema_version": 1, "grant_id": "engineer-1", "release_id": "beta-rc1",
+            "challenge": "ab".repeat(32), "active": true,
+            "activated_at": 100, "checked_at": 100, "expires_at": 120,
+        }))
+        .unwrap();
+        let signature = key.sign(&[SIGNING_DOMAIN, &body].concat());
+        let verify = |release, now| {
+            authenticate_offline_pass(
+                key.public_key().as_ref().try_into().unwrap(),
+                &body,
+                signature.as_ref().try_into().unwrap(),
+                Some(release),
+                now,
+            )
+        };
+        assert_eq!(verify("beta-rc1", 100).unwrap().grant_id(), "engineer-1");
+        assert_eq!(verify("beta-rc2", 100).unwrap_err(), AccessError::Invalid);
+        assert_eq!(verify("beta-rc1", 99).unwrap_err(), AccessError::Invalid);
+        assert_eq!(verify("beta-rc1", 120).unwrap().expires_at(), 120);
     }
 
     fn hex_bytes(value: &str) -> Vec<u8> {

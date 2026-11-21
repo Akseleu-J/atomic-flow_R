@@ -1,20 +1,35 @@
-//! B1 client wiring (the issuance half lives in tools/issuance_server.py,
-//! the verifier in af_program::beta_access). The official beta build pins
-//! the issuer public key at packaging time; with a pinned key every new
-//! product operation re-checks access ONLINE - the 30-second decision
-//! freshness makes clock rollback unable to reuse a stale decision. Dev
-//! builds without a pinned key are honestly ungated and report themselves
-//! as such; offline strictness for real deployments stays an explicit owner
-//! decision (ENGINEER_BETA_PLAN, B1).
+//! Official beta builds require an offline pass signed by the pinned issuer.
+//! Unpinned builds may opt in to the legacy development issuance service.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::Path;
 
-pub const BETA_ISSUER_PUBKEY_HEX: &str = match option_env!("AF_BETA_ISSUER_PUBKEY_HEX") {
-    Some(value) => value,
-    None => "",
-};
+const MAX_CLOCK_ROLLBACK_SECS: u64 = 300;
+const LAST_SEEN_FILE: &str = "beta-last-seen";
+
+const PINNED_ISSUER: Option<&str> = option_env!("AF_BETA_ISSUER_PUBKEY_HEX");
+const PINNED_RELEASE: Option<&str> = option_env!("AF_BETA_RELEASE");
+
+fn issuer_key(pinned: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    if let Some(key) = pinned {
+        return hex_32(key)
+            .map(Some)
+            .ok_or("invalid pinned beta issuer key".into());
+    }
+    #[cfg(feature = "dev-gate")]
+    match std::env::var("AF_BETA_ISSUER_PUBKEY") {
+        Ok(key) => {
+            return hex_32(&key)
+                .map(Some)
+                .ok_or("invalid dev beta issuer key".into())
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => return Err("invalid dev beta issuer key".into()),
+    }
+    Ok(None)
+}
 
 const MAX_RESPONSE_BYTES: usize = 4096;
 const OFFLINE_PASS_FILE: &str = "beta-pass.json";
@@ -28,13 +43,7 @@ pub struct GateConfig {
 }
 
 impl GateConfig {
-    pub fn from_env() -> Option<Self> {
-        let pubkey_hex = std::env::var("AF_BETA_ISSUER_PUBKEY")
-            .unwrap_or_else(|_| BETA_ISSUER_PUBKEY_HEX.to_string());
-        if pubkey_hex.is_empty() {
-            return None;
-        }
-        let issuer_pubkey = hex_32(&pubkey_hex)?;
+    fn from_env(issuer_pubkey: [u8; 32]) -> Option<Self> {
         Some(GateConfig {
             issuer_pubkey,
             grant_id: std::env::var("AF_BETA_GRANT").ok()?,
@@ -58,7 +67,7 @@ struct DecisionEnvelope {
 }
 
 fn hex_32(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -178,77 +187,147 @@ fn decision_provenance(body: &[u8]) -> Option<(u64, u64)> {
 }
 
 /// Verify the signed pass envelope file and return the trusted decision.
-pub fn verify_pass_file(
-    pass_path: &std::path::Path,
+fn verify_pass_file(
+    pass_path: &Path,
+    issuer_key: &[u8; 32],
+    release: Option<&str>,
     now: u64,
 ) -> Result<af_program::beta_access::AccessDecision, String> {
-    let text =
-        std::fs::read_to_string(pass_path).map_err(|e| format!("beta pass read failed: {e}"))?;
-    let pass: Value =
-        serde_json::from_str(&text).map_err(|_| "beta pass is not valid JSON".to_string())?;
-    let body_b64 = pass
-        .get("decision_b64")
-        .and_then(Value::as_str)
-        .ok_or("beta pass missing decision_b64")?;
-    let sig_hex = pass
-        .get("signature_hex")
-        .and_then(Value::as_str)
-        .ok_or("beta pass missing signature_hex")?;
-    let body = base64_decode(body_b64)?;
-    let signature = hex_64(sig_hex)?;
-    let pubkey_hex = std::env::var("AF_BETA_ISSUER_PUBKEY")
-        .unwrap_or_else(|_| BETA_ISSUER_PUBKEY_HEX.to_string());
-    let issuer_key = hex_32(&pubkey_hex).ok_or("beta issuer pubkey is invalid")?;
-    let grant_id = pass
-        .get("grant_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let release_id = pass
-        .get("release_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    af_program::beta_access::verify_offline_pass(
-        &issuer_key,
-        &body,
-        &signature,
-        &grant_id,
-        &release_id,
-        now,
-    )
-    .map_err(|e| match e {
-        af_program::beta_access::AccessError::Inactive => {
-            "beta access expired - the pass window has closed".to_string()
+    let file = std::fs::File::open(pass_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "beta pass required: install beta-pass.json".into()
+        } else {
+            format!("beta pass read failed: {error}")
         }
-        _ => "beta pass is invalid (wrong grant/release or tampered)".to_string(),
-    })
-}
-
-pub fn gate_offline_pass(pass_path: &std::path::Path, now: u64) -> Result<(), String> {
-    verify_pass_file(pass_path, now).map(|_| ())
-}
-
-/// `af beta`: the offline pass first (the pivot made it the primary access
-/// channel), then the online service, then the honest dev-build message.
-pub fn status_report(now: u64) -> String {
-    let pass_file = af_sandbox::user_dir().join(OFFLINE_PASS_FILE);
-    if pass_file.exists() {
-        return match verify_pass_file(&pass_file, now) {
-            Ok(decision) => {
-                let remaining = decision.expires_at().saturating_sub(now);
-                format!(
-                    "beta pass: ACTIVE, {}h {}m remaining (grant {}, release {})",
-                    remaining / 3600,
-                    (remaining % 3600) / 60,
-                    decision.grant_id(),
-                    decision.release_id()
-                )
-            }
-            Err(message) => format!("beta pass: {message}"),
-        };
+    })?;
+    let mut raw = Vec::new();
+    file.take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("beta pass read failed: {error}"))?;
+    if raw.len() > MAX_RESPONSE_BYTES {
+        return Err("beta pass is too large".into());
     }
-    match GateConfig::from_env() {
+    #[derive(Deserialize)]
+    struct OfflineEnvelope {
+        decision_b64: String,
+        signature_hex: String,
+    }
+    let pass: OfflineEnvelope = serde_json::from_slice(&raw)
+        .map_err(|_| "beta pass is not a valid envelope".to_string())?;
+    let body = base64_decode(&pass.decision_b64)?;
+    let signature = hex_64(&pass.signature_hex)?;
+    af_program::beta_access::authenticate_offline_pass(issuer_key, &body, &signature, release, now)
+        .map_err(|e| match e {
+            af_program::beta_access::AccessError::Inactive => "beta pass is inactive".to_string(),
+            _ => "beta pass is invalid (wrong release or tampered)".to_string(),
+        })
+}
+
+fn offline_required(
+    pass_file: &Path,
+    pinned_issuer: Option<&str>,
+    pinned_release: Option<&str>,
+    now: u64,
+) -> Result<Option<af_program::beta_access::AccessDecision>, String> {
+    let Some(issuer) = issuer_key(pinned_issuer)? else {
+        return Ok(None);
+    };
+    if pinned_issuer.is_some() {
+        let release = pinned_release
+            .filter(|release| !release.is_empty())
+            .ok_or("missing pinned beta release ID")?;
+        return verify_pass_file(pass_file, &issuer, Some(release), now).map(Some);
+    }
+    if pass_file.exists() {
+        return verify_pass_file(pass_file, &issuer, None, now).map(Some);
+    }
+    Ok(None)
+}
+
+fn effective_time(home: &Path, now: u64, persist: bool) -> Result<u64, String> {
+    let _lease = if persist {
+        Some(af_entropy::FileLease::acquire(
+            &home.join("beta-last-seen.lock"),
+            true,
+            "beta clock marker is busy",
+        )?)
+    } else {
+        None
+    };
+    let marker = home.join(LAST_SEEN_FILE);
+    let previous = match std::fs::File::open(&marker) {
+        Ok(file) => {
+            let mut value = String::new();
+            file.take(21)
+                .read_to_string(&mut value)
+                .map_err(|e| format!("beta clock marker read failed: {e}"))?;
+            value
+                .parse::<u64>()
+                .map_err(|_| "invalid beta clock marker")?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(format!("beta clock marker read failed: {error}")),
+    };
+    if previous.saturating_sub(now) > MAX_CLOCK_ROLLBACK_SECS {
+        return Err("beta access refused: clock rollback detected".into());
+    }
+    if persist && now > previous {
+        let temporary = home.join(format!("beta-last-seen-{}.tmp", af_entropy::token()));
+        let save = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            write!(file, "{now}")?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &marker)
+        })();
+        if let Err(error) = save {
+            let _ = std::fs::remove_file(temporary);
+            return Err(format!("beta clock marker write failed: {error}"));
+        }
+    }
+    Ok(now.max(previous))
+}
+
+fn development_service() -> Option<GateConfig> {
+    issuer_key(None)
+        .ok()
+        .flatten()
+        .and_then(GateConfig::from_env)
+}
+
+/// Report the same offline admission decision used by product operations.
+pub fn status_report(now: u64) -> String {
+    let home = af_sandbox::user_dir();
+    let pass_file = home.join(OFFLINE_PASS_FILE);
+    match offline_required(&pass_file, PINNED_ISSUER, PINNED_RELEASE, now) {
+        Ok(Some(decision)) => {
+            let now = if PINNED_ISSUER.is_some() {
+                match effective_time(&home, now, false) {
+                    Ok(now) => now,
+                    Err(message) => return format!("beta pass: REFUSED - {message}"),
+                }
+            } else {
+                now
+            };
+            if decision.expires_at() <= now {
+                return "beta pass: REFUSED - the pass window has closed".into();
+            }
+            let remaining = decision.expires_at() - now;
+            return format!(
+                "beta pass: ACTIVE, {}h {}m remaining (grant {}, release {})",
+                remaining / 3600,
+                (remaining % 3600) / 60,
+                decision.grant_id(),
+                decision.release_id()
+            );
+        }
+        Err(message) => return format!("beta pass: REFUSED - {message}"),
+        Ok(None) => {}
+    }
+    match development_service() {
         None => "beta gate: disabled (dev build without a pinned issuer key)".into(),
         Some(config) => match check(&config, now) {
             Ok(GateOutcome::Active { expires_in_secs }) => format!(
@@ -263,13 +342,41 @@ pub fn status_report(now: u64) -> String {
     }
 }
 
-pub fn gate_new_operation(now: u64) -> Result<(), String> {
-    // Offline mode: a signed pass file replaces the online service check.
-    let pass_file = af_sandbox::user_dir().join(OFFLINE_PASS_FILE);
-    if pass_file.exists() {
-        return gate_offline_pass(&pass_file, now);
+pub fn require_current_access() -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system time is before the Unix epoch")?
+        .as_secs();
+    gate_new_operation(now)
+}
+
+fn gate_new_operation(now: u64) -> Result<(), String> {
+    let home = af_sandbox::user_dir();
+    let pass_file = home.join(OFFLINE_PASS_FILE);
+    if let Some(decision) = offline_required(&pass_file, PINNED_ISSUER, PINNED_RELEASE, now)? {
+        let now = if PINNED_ISSUER.is_some() {
+            effective_time(&home, now, true)?
+        } else {
+            now
+        };
+        if decision.expires_at() <= now {
+            let message = "beta access expired - the pass window has closed";
+            if PINNED_ISSUER.is_some() {
+                let _retirement = af_entropy::FileLease::acquire(
+                    &home.join("beta-retirement.lock"),
+                    true,
+                    "beta retirement is busy",
+                )?;
+                self_destruct(decision.grant_id(), now)?;
+                return Err(format!(
+                    "{message}. See beta-final-report in the Atomic Flow state directory."
+                ));
+            }
+            return Err(message.into());
+        }
+        return Ok(());
     }
-    match GateConfig::from_env() {
+    match development_service() {
         None => Ok(()),
         Some(config) => match check(&config, now)? {
             GateOutcome::Active { .. } => Ok(()),
@@ -284,7 +391,14 @@ pub fn gate_new_operation(now: u64) -> Result<(), String> {
     }
 }
 
-pub fn self_destruct(grant_id: &str, now: u64) -> Result<Value, String> {
+fn self_destruct(grant_id: &str, now: u64) -> Result<Value, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own exe: {e}"))?;
+    if !exe
+        .try_exists()
+        .map_err(|e| format!("cannot inspect own exe: {e}"))?
+    {
+        return Err("beta access expired; this binary path is already unavailable".into());
+    }
     let home = af_sandbox::user_dir();
     let preserve_dir = home.join("beta-final-report");
     std::fs::create_dir_all(&preserve_dir)
@@ -305,28 +419,28 @@ pub fn self_destruct(grant_id: &str, now: u64) -> Result<Value, String> {
         let _ = std::fs::copy(&crash_src, preserve_dir.join("crash.jsonl"));
     }
 
-    let report = json!({
+    let mut report = json!({
         "schema": "atomic-flow/self-destruct/v1",
         "grant_id": grant_id,
         "at_unix": now,
         "evidence_note": evidence_note,
-        "message": "Your 96-hour beta window has expired. Your project files and evidence are preserved in this folder. The program binaries have been removed.",
+        "message": "Your beta window has expired. Project files and local journals remain in their original locations.",
+        "binary_retired": false,
     });
-    std::fs::write(
-        preserve_dir.join("self-destruct-report.json"),
-        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("self-destruct report write failed: {e}"))?;
+    let report_path = preserve_dir.join("self-destruct-report.json");
+    let write_report = |report: &Value| {
+        let bytes = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
+        std::fs::write(&report_path, bytes)
+            .map_err(|e| format!("self-destruct report write failed: {e}"))
+    };
+    write_report(&report)?;
 
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own exe: {e}"))?;
-    let trash = exe.with_extension("af-beta-deleted");
-    let _ = std::fs::rename(&exe, &trash);
+    let trash = exe.with_extension(format!("{}.af-beta-deleted", af_entropy::token()));
+    std::fs::rename(&exe, &trash)
+        .map_err(|e| format!("beta access expired; binary retirement failed: {e}"))?;
     schedule_delete_on_reboot(&trash);
-
-    let studio_dist = home.join("studio-dist");
-    if studio_dist.exists() {
-        let _ = std::fs::remove_dir_all(&studio_dist);
-    }
+    report["binary_retired"] = json!(true);
+    write_report(&report)?;
 
     Ok(report)
 }
@@ -352,7 +466,9 @@ fn schedule_delete_on_reboot(path: &std::path::Path) {
 }
 
 #[cfg(not(windows))]
-fn schedule_delete_on_reboot(_path: &std::path::Path) {}
+fn schedule_delete_on_reboot(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
 
 pub fn open_feedback_email(grant_id: &str) -> Result<(), String> {
     let subject = format!("Atomic Flow beta feedback - {grant_id}");
@@ -372,5 +488,73 @@ pub fn open_feedback_email(grant_id: &str) -> Result<(), String> {
     match output {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("cannot open email client: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_build_requires_a_pass_and_release() {
+        let pass = std::env::temp_dir()
+            .join(format!("af-missing-pass-{}", af_entropy::token()))
+            .join(OFFLINE_PASS_FILE);
+        let issuer = "42".repeat(32);
+        assert_eq!(
+            offline_required(&pass, Some(&issuer), Some("beta-rc2"), 100).unwrap_err(),
+            "beta pass required: install beta-pass.json"
+        );
+        assert_eq!(
+            offline_required(&pass, Some(&issuer), None, 100).unwrap_err(),
+            "missing pinned beta release ID"
+        );
+        assert!(offline_required(&pass, Some(""), Some("beta-rc2"), 100).is_err());
+    }
+
+    #[test]
+    fn clock_marker_persists_the_maximum_and_rejects_rollback() {
+        let home = std::env::temp_dir().join(format!("af-beta-clock-{}", af_entropy::token()));
+        assert_eq!(effective_time(&home, 1000, true).unwrap(), 1000);
+        assert_eq!(effective_time(&home, 701, true).unwrap(), 1000);
+        assert_eq!(
+            effective_time(&home, 699, true).unwrap_err(),
+            "beta access refused: clock rollback detected"
+        );
+        assert_eq!(effective_time(&home, 1200, true).unwrap(), 1200);
+        assert_eq!(effective_time(&home, 1000, false).unwrap(), 1200);
+        std::fs::write(home.join(LAST_SEEN_FILE), "corrupt").unwrap();
+        assert!(effective_time(&home, 1300, true).is_err());
+        std::fs::remove_file(home.join(LAST_SEEN_FILE)).unwrap();
+        std::fs::remove_file(home.join("beta-last-seen.lock")).unwrap();
+        std::fs::remove_dir(home).unwrap();
+    }
+
+    #[test]
+    fn issuer_override_is_opt_in_and_cannot_replace_a_pin() {
+        // Isolate process-wide environment changes from every other test.
+        const CHILD: &str = "AF_TEST_BETA_ISSUER_CHILD";
+        let pinned = "42".repeat(32);
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(issuer_key(Some(&pinned)).unwrap(), Some([0x42; 32]));
+            let dev = cfg!(feature = "dev-gate").then_some([0x19; 32]);
+            assert_eq!(issuer_key(None).unwrap(), dev);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "beta_gate::tests::issuer_override_is_opt_in_and_cannot_replace_a_pin",
+            ])
+            .env(CHILD, "1")
+            .env("AF_BETA_ISSUER_PUBKEY", "19".repeat(32))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

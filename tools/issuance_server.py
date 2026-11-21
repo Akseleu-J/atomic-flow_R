@@ -51,11 +51,9 @@ def generate_key(directory: Path) -> None:
     pub = directory / "key.pub.pem"
     openssl(["genpkey", "-algorithm", "ed25519", "-out", str(key)])
     openssl(["pkey", "-in", str(key), "-pubout", "-out", str(pub)])
-    print(f"key written: {key} (seed hex for the official build below)")
-    text = openssl(["pkey", "-in", str(key), "-text", "-noout"]).decode()
-    hex_start = text.index("priv:") + 5
-    raw = text[hex_start:].replace(":", "").replace(" ", "").replace("\n", "").strip()[:64]
-    print(raw)
+    public_der = openssl(["pkey", "-pubin", "-in", str(pub), "-outform", "DER"])
+    print(f"key written: {key}")
+    print(f"issuer public key (hex): {public_der[-32:].hex()}")
 
 
 def oneshot(args: list, data: bytes) -> bytes:
@@ -244,7 +242,7 @@ def fixture(out_path: Path) -> None:
 def generate_offline_pass(key_path: Path, out_path: str, grant_id: str, release_id: str) -> None:
     """Generate a signed offline pass JSON file (no server needed). The
     participant saves this to ~/.atomic_flow/beta-pass.json and the af
-    binary verifies it locally via verify_offline_pass."""
+    binary verifies it locally against its pinned issuer and release."""
     now = int(time.time())
     challenge = os.urandom(32).hex()
     body = make_decision(grant_id, release_id, challenge, now,

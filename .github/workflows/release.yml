@@ -4,6 +4,15 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      beta_release_id:
+        description: Release ID that the issuer must sign into beta passes
+        required: true
+        default: beta-rc1
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,12 +36,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-      - name: Pin the beta issuer public key (B1)
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        working-directory: rust
+        run: rustup install --no-self-update
+      - name: Pin beta issuer and release ID
         shell: bash
-        run: echo "AF_BETA_ISSUER_PUBKEY_HEX=b7df426bfbf34584421f38dd4505e6e9a40fc5e4824d31625c5ca39f5e6921ab" >> $GITHUB_ENV
+        env:
+          BETA_RELEASE_ID: ${{ inputs.beta_release_id || github.ref_name }}
+        run: |
+          [[ "$BETA_RELEASE_ID" =~ ^[a-zA-Z0-9._-]{1,96}$ ]]
+          echo "AF_BETA_RELEASE=$BETA_RELEASE_ID" >> "$GITHUB_ENV"
+          echo "AF_BETA_ISSUER_PUBKEY_HEX=b7df426bfbf34584421f38dd4505e6e9a40fc5e4824d31625c5ca39f5e6921ab" >> "$GITHUB_ENV"
 
       - name: Linux native build dependencies
         if: runner.os == 'Linux'
@@ -42,24 +58,31 @@ jobs:
       - name: Set reproducible build environment
         shell: bash
         run: |
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
-          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
-          echo "RUSTFLAGS=--remap-path-prefix $HOME/.cargo=/cargo --remap-path-prefix $GITHUB_WORKSPACE=/build" >> $GITHUB_ENV
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix $HOME/.cargo=/cargo --remap-path-prefix $GITHUB_WORKSPACE=/build" >> "$GITHUB_ENV"
+      - name: Record source commit
         shell: bash
         run: |
           mkdir -p dist
           git rev-parse HEAD > dist/commit.txt
-      - name: Build release binary
+      - name: Build one auditable release binary
+        shell: bash
         working-directory: rust
         env:
           CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-        run: cargo build --release -p af-cli --locked
+        run: |
+          cargo install cargo-auditable --version 0.7.7 --locked
+          cargo auditable build --release -p af-cli --locked
+          cargo tree --locked -p af-cli > ../dist/${{ matrix.os }}-dependencies.txt
       - name: Smoke the binary
         shell: bash
         run: |
-          rust/target/release/${{ matrix.binary }} --version
-          rust/target/release/${{ matrix.binary }} self-test
+          binary=rust/target/release/${{ matrix.binary }}
+          export ATOMIC_FLOW_HOME="$RUNNER_TEMP/af-release-smoke"
+          "$binary" --version
+          "$binary" self-test
+          "$binary" beta | grep -F 'REFUSED - beta pass required'
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         if: github.event_name == 'workflow_dispatch'
         with:
@@ -87,13 +110,7 @@ jobs:
         with:
           name: engineer-beta-${{ matrix.os }}
           path: beta/
-      - name: Generate SBOM (cargo auditable)
-        shell: bash
-        run: |
-          cargo install cargo-auditable --locked 2>&1 | tail -1 || true
-          cargo auditable build --release -p af-cli 2>&1 | tail -1
-          cargo tree --locked > beta/dependency-tree.txt
-
+          if-no-files-found: error
       - name: Package (windows zip)
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -105,18 +122,21 @@ jobs:
         shell: bash
         run: |
           cp rust/target/release/af dist/
-          cp dist/commit.txt .
           tar -czf dist/${{ matrix.artifact }} -C dist af commit.txt
       - name: SHA256SUMS
         shell: bash
         run: |
           cd dist
-          sha256sum ${{ matrix.artifact }} > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+          cat ${{ matrix.artifact }}.sha256
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.os }}
-          path: dist/
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+            dist/${{ matrix.os }}-dependencies.txt
+          if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
@@ -127,13 +147,24 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
         with:
           path: dist
+          pattern: release-*
           merge-multiple: true
-      - name: Generate changelog from tagged commits
+      - name: Verify published archive checksums
+        working-directory: dist
         run: |
-          { echo "# atomic-flow ${{ github.ref_name }}"
+          cat af-windows-x64.zip.sha256 af-linux-x64.tar.gz.sha256 > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+      - name: Generate changelog from tagged commits
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          { echo "# atomic-flow $RELEASE_TAG"
             echo
             echo "Portable af binaries (single executable, embedded dashboard)."
             echo "Verify with SHA256SUMS.txt; commit of record in commit.txt."
@@ -145,8 +176,9 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "atomic-flow ${{ github.ref_name }}" \
+          gh release create "$RELEASE_TAG" \
+            --title "atomic-flow $RELEASE_TAG" \
             --notes-file dist/CHANGELOG.md \
-            dist/af-windows-x64.zip dist/af-linux-x64.tar.gz dist/SHA256SUMS.txt
+            dist/af-windows-x64.zip dist/af-linux-x64.tar.gz dist/SHA256SUMS.txt dist/*-dependencies.txt

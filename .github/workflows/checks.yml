@@ -14,6 +14,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  actionlint:
+    name: Validate GitHub Actions workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run actionlint 1.7.11
+        shell: bash
+        run: |
+          work_dir="$(mktemp -d)"
+          archive=actionlint_1.7.11_linux_amd64.tar.gz
+          curl --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.11/"$archive" \
+            --output "$work_dir/$archive"
+          (cd "$work_dir" && echo "900919a84f2229bac68ca9cd4103ea297abc35e9689ebb842c6e34a3d1b01b0a  $archive" | sha256sum --check)
+          tar -xzf "$work_dir/$archive" -C "$work_dir" actionlint
+          "$work_dir/actionlint" -shellcheck= -pyflakes=
+
   wheel:
     name: Installed wheel acceptance
     runs-on: ubuntu-24.04

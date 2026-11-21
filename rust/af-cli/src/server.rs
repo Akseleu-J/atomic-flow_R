@@ -1,10 +1,10 @@
 //! `af serve`: the self-host HTTP API (headless, E08-compatible). Loopback by
-//! default; any non-loopback bind REQUIRES a server token, compared in
-//! constant time. Sessions, edit journeys and job status over JSON.
+//! default; every listener requires a server token, compared in constant time.
 
 use axum::{
-    extract::{DefaultBodyLimit, Path as AxPath, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Path as AxPath, Query, Request, State},
+    http::{HeaderMap, Method, StatusCode},
+    middleware::Next,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -40,9 +41,11 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Clone)]
 struct ServerState {
     token: Option<String>,
+    beta_check: fn() -> Result<(), String>,
     studio: Option<Arc<studio_build::StudioBuild>>,
     reviewed_edit: Option<Arc<reviewed_edit::Profile>>,
     port: u16,
+    allow_remote_host: bool,
     streams: Arc<tokio::sync::Semaphore>,
     edits: Arc<tokio::sync::Semaphore>,
     // The rfd folder-picker admission lives behind cfg(windows); on
@@ -57,7 +60,7 @@ fn authorized(state: &ServerState, headers: &HeaderMap) -> bool {
         return false;
     }
     let Some(expected) = &state.token else {
-        return true; // no token configured (loopback bind only)
+        return true; // in-process tests can construct an open router
     };
     let supplied = headers
         .get("Authorization")
@@ -69,21 +72,32 @@ fn authorized(state: &ServerState, headers: &HeaderMap) -> bool {
 
 #[cfg(test)]
 fn build_router(token: Option<String>) -> Router {
-    build_router_for(token, 8787, None, None)
+    build_router_for(
+        token,
+        8787,
+        false,
+        None,
+        None,
+        crate::beta_gate::require_current_access,
+    )
 }
 
 fn build_router_for(
     token: Option<String>,
     port: u16,
+    allow_remote_host: bool,
     studio: Option<Arc<studio_build::StudioBuild>>,
     reviewed_edit: Option<Arc<reviewed_edit::Profile>>,
+    beta_check: fn() -> Result<(), String>,
 ) -> Router {
     let token = token.filter(|value| !value.is_empty());
     let state = ServerState {
         token,
+        beta_check,
         studio,
         reviewed_edit,
         port,
+        allow_remote_host,
         streams: Arc::new(tokio::sync::Semaphore::new(4)),
         edits: Arc::new(tokio::sync::Semaphore::new(1)),
         picker: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -115,11 +129,45 @@ fn build_router_for(
         .route("/v1/graph/{root_id}", get(graph_read_ep))
         .merge(studio_data::routes())
         .layer(DefaultBodyLimit::max(1_048_576))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            beta_admission,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             http_safety::guard,
         ))
         .with_state(state)
+}
+
+async fn beta_admission(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if !path.starts_with("/v1/") {
+        return next.run(request).await;
+    }
+    if !authorized(&state, request.headers()) {
+        return api_error(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let diagnostic = matches!(*request.method(), Method::GET | Method::HEAD)
+        && matches!(path, "/v1/doctor" | "/v1/capabilities" | "/v1/budget");
+    if !diagnostic {
+        match tokio::task::spawn_blocking(state.beta_check).await {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => return api_error(StatusCode::FORBIDDEN, reason).into_response(),
+            Err(_) => {
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "beta verification unavailable",
+                )
+                .into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 /// Data-only protocol capabilities. No source or execution authority is exposed.
@@ -1318,15 +1366,36 @@ pub fn bind_allowed(bind: &str, token: &Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn new_server_token() -> Result<String, String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "server token generation failed")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 pub async fn run(
     bind: &str,
     token: Option<String>,
     studio_dist: Option<PathBuf>,
     reviewed_edit_profile: Option<PathBuf>,
 ) -> Result<(), String> {
-    if reviewed_edit_profile.is_some() && token.as_ref().is_none_or(String::is_empty) {
-        return Err("reviewed edit profile requires server authentication".into());
+    bind_allowed(bind, &token)?;
+    if token.as_ref().is_some_and(|value| {
+        value.is_empty() || value.len() > 512 || !value.bytes().all(|b| b.is_ascii_graphic())
+    }) {
+        return Err("server token must contain 1 to 512 visible ASCII characters".into());
     }
+    let generated = token.is_none();
+    if generated && !std::io::stderr().is_terminal() {
+        return Err("non-interactive af serve requires --token-env or --token".into());
+    }
+    let token = match token {
+        Some(token) => token,
+        None => new_server_token()?,
+    };
     let reviewed_edit = reviewed_edit_profile
         .as_deref()
         .map(reviewed_edit::Profile::load)
@@ -1337,15 +1406,32 @@ pub async fn run(
         .map(studio_build::StudioBuild::load)
         .transpose()?
         .map(Arc::new);
-    bind_allowed(bind, &token)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| format!("bind {bind} failed: {error}"))?;
-    let port = listener
+    let address = listener
         .local_addr()
-        .map_err(|_| "listener identity unavailable".to_string())?
-        .port();
-    let app = build_router_for(token, port, studio, reviewed_edit);
+        .map_err(|_| "listener identity unavailable".to_string())?;
+    let allow_remote_host = !address.ip().is_loopback();
+    if generated {
+        if allow_remote_host {
+            return Err("non-loopback bind requires an explicit server token".into());
+        }
+        let page = if studio.is_some() {
+            "/studio/"
+        } else {
+            "/dashboard"
+        };
+        eprintln!("Open http://{address}{page} and enter the server token: {token}");
+    }
+    let app = build_router_for(
+        Some(token),
+        address.port(),
+        allow_remote_host,
+        studio,
+        reviewed_edit,
+        crate::beta_gate::require_current_access,
+    );
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("serve failed: {error}"))
@@ -1377,6 +1463,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn generated_loopback_tokens_are_distinct_and_required_for_product_api() {
+        let token = new_server_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert_ne!(token, new_server_token().unwrap());
+        let app = build_router_for(Some(token.clone()), 8787, false, None, None, || Ok(()));
+        for (host, bearer, expected) in [
+            ("127.0.0.1:8787", None, StatusCode::UNAUTHORIZED),
+            ("127.0.0.1:8787", Some(token.as_str()), StatusCode::OK),
+            (
+                "192.0.2.1:8787",
+                Some(token.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/v1/capabilities")
+                .header("Host", host);
+            let request = match bearer {
+                Some(bearer) => request.header("Authorization", format!("Bearer {bearer}")),
+                None => request,
+            };
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 
     #[tokio::test]
@@ -1419,6 +1536,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn beta_admission_gates_every_product_route_before_handler_work() {
+        let app = build_router_for(Some("test-token".into()), 8787, false, None, None, || {
+            Err("test beta refusal".into())
+        });
+        let request = |method: &str, path: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("Host", "127.0.0.1:8787")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (method, path) in [
+            ("GET", "/v1/sessions"),
+            ("POST", "/v1/sessions"),
+            ("GET", "/v1/sessions/id"),
+            ("POST", "/v1/sessions/id/events"),
+            ("GET", "/v1/sessions/id/history"),
+            ("POST", "/v1/sessions/id/snapshot"),
+            ("POST", "/v1/sessions/id/rewind"),
+            ("POST", "/v1/edit-journeys"),
+            ("POST", "/v1/task-run"),
+            ("GET", "/v1/reviewed-edit"),
+            ("POST", "/v1/reviewed-edit"),
+            ("POST", "/v1/chat/stream"),
+            ("GET", "/v1/jobs"),
+            ("GET", "/v1/roots"),
+            ("POST", "/v1/roots"),
+            ("DELETE", "/v1/roots/id"),
+            ("GET", "/v1/roots/id/file"),
+            ("POST", "/v1/pick-folder"),
+            ("POST", "/v1/budget"),
+            ("POST", "/v1/graph/build"),
+            ("GET", "/v1/graph/id"),
+            ("GET", "/v1/providers"),
+        ] {
+            let response = app.clone().oneshot(request(method, path)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&bytes).contains("test beta refusal"));
+        }
+        for path in ["/health", "/v1/capabilities", "/v1/doctor", "/v1/budget"] {
+            let response = app.clone().oneshot(request("GET", path)).await.unwrap();
+            assert_ne!(response.status(), StatusCode::FORBIDDEN, "GET {path}");
+        }
+        let mut unauthenticated = request("POST", "/v1/task-run");
+        unauthenticated.headers_mut().remove("Authorization");
+        let response = app.oneshot(unauthenticated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -59,15 +59,15 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          profile: minimal
+      - name: Install the pinned Rust toolchain
+        working-directory: rust
+        run: rustup install --no-self-update
       - name: Record tested source
         run: |
           mkdir -p validation/docker
           git rev-parse HEAD > validation/docker/commit.txt
-          rustc --version --verbose > validation/docker/rustc.txt
-          cargo --version > validation/docker/cargo.txt
+          (cd rust && rustc --version --verbose) > validation/docker/rustc.txt
+          (cd rust && cargo --version) > validation/docker/cargo.txt
           docker version > validation/docker/docker-version.txt
           python3 validation/production-20261104/capture_source.py validation/docker/source.json
       - name: Check Docker evidence refusal cases without Docker

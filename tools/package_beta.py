@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -22,9 +23,12 @@ channel, then extract it to a new directory. From that directory run
 `./af doctor` on Linux or `.\\af.exe doctor` in PowerShell.
 
 On Linux, run `chmod +x ./af` if your extractor did not preserve permissions.
+Save the pass from your invitation in `~/.atomic_flow/beta-pass.json`
+(`%USERPROFILE%\\.atomic_flow\\beta-pass.json` on Windows) and run `af beta`.
 Start Studio using `./af serve --studio-dist studio` on Linux or
 `.\\af.exe serve --studio-dist studio` in PowerShell, then open
-http://127.0.0.1:8787/studio/ in your browser. Leave the server bound to loopback.
+http://127.0.0.1:8787/studio/ in your browser. Enter the server token printed
+by af in both Studio and the dashboard. Leave the server bound to loopback.
 Stop it with Ctrl+C.
 
 Use the main dashboard at http://127.0.0.1:8787/dashboard to register the
@@ -76,8 +80,8 @@ def smoke_studio(binary, root, env, files):
     base = f"http://127.0.0.1:{port}/studio/"
     http = build_opener(ProxyHandler({}))
     with subprocess.Popen(
-        [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--studio-dist", "studio"],
-        cwd=root, env=env, stdout=subprocess.DEVNULL,
+        [str(binary), "serve", "--bind", f"127.0.0.1:{port}", "--studio-dist", "studio", "--token-env", "AF_BETA_SMOKE_TOKEN"],
+        cwd=root, env={**env, "AF_BETA_SMOKE_TOKEN": secrets.token_hex(32)}, stdout=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     ) as process:
         try:

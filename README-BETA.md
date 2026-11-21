@@ -1,9 +1,9 @@
 # Atomic Flow — engineer beta quickstart
 
-Your beta pass is **96 hours** from first activation. `af beta` shows the
+Your beta pass is valid for **96 hours** from issue. `af beta` shows the
 remaining time at any moment. Everything runs **on your machine** (self-host):
-your provider key stays with you, your project never leaves your disk, and the
-only network traffic is the model API you configure and the pass check.
+your provider key stays with you, your project never leaves your disk, and
+pass verification runs offline.
 
 ## 1. Install
 
@@ -34,13 +34,18 @@ cd .\atomic-flow-beta
 
 ## 2. First run (10 minutes)
 
-1. Start Studio (loopback only, stop with Ctrl+C):
+1. Save your issued `beta-pass.json` in `~/.atomic_flow/`
+   (`%USERPROFILE%\.atomic_flow\` on Windows). Run `af beta` and confirm
+   that it reports an active pass for your build. Start Studio on loopback
+   and stop it with Ctrl+C:
 
 ```bash
 ./af serve --studio-dist studio     # open http://127.0.0.1:8787/studio/
 ```
 
-2. Register a workspace: pick your project folder in the Studio settings.
+2. Paste the server token printed in your terminal into Studio's connection
+   settings. Pick your project folder in the workspace settings. For
+   unattended operation, provide a token via `--token-env`.
 3. Your provider key stays in your environment: choose a supported provider
    and model in Studio, then set a spending ceiling:
 

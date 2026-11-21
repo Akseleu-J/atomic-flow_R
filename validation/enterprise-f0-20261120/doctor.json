@@ -1,0 +1,89 @@
+{
+  "checks": [
+    {
+      "detail": "0.1.0",
+      "name": "kernel_version",
+      "ok": true
+    },
+    {
+      "detail": {
+        "path": "<synthetic-state>",
+        "writable": true
+      },
+      "name": "atomic_flow_home",
+      "ok": true
+    },
+    {
+      "detail": {
+        "exists": true,
+        "path": "<synthetic-state>/sessions"
+      },
+      "name": "sessions_dir",
+      "ok": true
+    },
+    {
+      "detail": {
+        "path": "C:\\Program Files\\Git\\cmd\\git.exe",
+        "version": "git version 2.56.0.windows.4"
+      },
+      "name": "git",
+      "ok": true
+    },
+    {
+      "detail": {
+        "reason": "docker not found; sandbox jobs fall back to local-trusted"
+      },
+      "name": "docker",
+      "ok": false
+    },
+    {
+      "detail": {
+        "on_path": false,
+        "reason": "Linux-only runtime"
+      },
+      "name": "firecracker",
+      "ok": false
+    },
+    {
+      "detail": {
+        "exists": false,
+        "path": "<synthetic-state>/graphs"
+      },
+      "name": "graphs_dir",
+      "ok": false
+    },
+    {
+      "detail": {
+        "newest_verify": {
+          "events": 2,
+          "incomplete_tail": false,
+          "verified": true
+        },
+        "sessions": [
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": 452,
+              "present": true,
+              "sequence": 2
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "f0-smoke",
+            "state": {
+              "offset": 452,
+              "pending": 0,
+              "sequence": 2,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          }
+        ]
+      },
+      "name": "journal_health",
+      "ok": true
+    }
+  ],
+  "ok": false
+}

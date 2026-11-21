@@ -37,7 +37,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Self-host HTTP API (headless; non-loopback bind requires --token).
+    /// Self-host HTTP API. Interactive loopback starts generate a server token.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
@@ -391,6 +391,10 @@ fn main() {
         }
     }
     if let Command::Mcp = cli.command {
+        if let Err(error) = beta_gate::require_current_access() {
+            eprintln!("af: {error}");
+            std::process::exit(1);
+        }
         let stdin = std::io::stdin().lock();
         let mut stdout = std::io::stdout().lock();
         let tools = mcp_tools();
@@ -420,6 +424,28 @@ fn main() {
 }
 
 fn run(command: Command) -> Result<String, String> {
+    if !matches!(
+        &command,
+        Command::Doctor { .. }
+            | Command::Beta
+            | Command::SelfTest
+            | Command::Evidence { .. }
+            | Command::Budget {
+                command: BudgetCommand::Show
+            }
+            | Command::Sandbox {
+                command: SandboxCommand::InspectRecovery { .. }
+                    | SandboxCommand::RecoverPublication { .. }
+            }
+            | Command::Session {
+                command: SessionCommand::Recover { .. }
+            }
+            | Command::Job {
+                command: JobCommand::Reconcile { .. }
+            }
+    ) {
+        beta_gate::require_current_access()?;
+    }
     match command {
         Command::Serve { .. } => unreachable!("serve is handled in main"),
         Command::Mcp => unreachable!("mcp is handled in main"),
@@ -787,6 +813,10 @@ fn mcp_tools() -> Vec<af_program::mcp_stdio::McpTool<'static>> {
                 }),
             },
             execute: &|arguments| {
+                // A stdio client may stay connected past the pass window.
+                if let Err(error) = beta_gate::require_current_access() {
+                    return json!({"error": error});
+                }
                 let Some(id) = arguments.get("id").and_then(Value::as_str) else {
                     return json!({"error": "session_read requires id"});
                 };
@@ -903,13 +933,6 @@ pub(crate) fn task_run(
     junit: Option<PathBuf>,
     budget_cap_usd: Option<String>,
 ) -> Result<String, String> {
-    // B1: a new product operation re-checks beta access online when the
-    // official build pins an issuer key (dev builds pass through ungated).
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    beta_gate::gate_new_operation(now_secs)?;
     let registry = af_sandbox::SandboxRegistry::new("default").map_err(|e| e.0)?;
     let reservation_ceiling = budget_cap_usd
         .as_deref()

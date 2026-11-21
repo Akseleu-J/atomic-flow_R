@@ -9,6 +9,9 @@ description = "The atomic-flow product binary: graph, sandbox, sessions, jobs an
 name = "af"
 path = "src/main.rs"
 
+[features]
+dev-gate = []
+
 [dependencies]
 af-evidence.workspace = true
 af-graph.workspace = true
@@ -24,6 +27,7 @@ af-entropy.workspace = true
 af-budget.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ring = "0.17"
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
@@ -40,7 +44,6 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 rfd = "0.15"
 
 [dev-dependencies]
-ring = "0.17"
 
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
