@@ -47,3 +47,9 @@ af-program = { path = "af-program" }
 
 [profile.release]
 lto = "thin"
+
+# The 3.4 GiB build host cannot link full dev debuginfo (rustc dies with
+# STATUS_STACK_BUFFER_OVERRUN); line tables keep backtraces readable while
+# cutting symbol volume far enough to link (audit response, В-2).
+[profile.dev]
+debug = "line-tables-only"

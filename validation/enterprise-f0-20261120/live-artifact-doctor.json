@@ -1,0 +1,222 @@
+{
+  "checks": [
+    {
+      "detail": "0.1.0",
+      "name": "kernel_version",
+      "ok": true
+    },
+    {
+      "detail": {
+        "path": "C:\\Users\\omirb\\.atomic_flow",
+        "writable": true
+      },
+      "name": "atomic_flow_home",
+      "ok": true
+    },
+    {
+      "detail": {
+        "exists": true,
+        "path": "C:\\Users\\omirb\\.atomic_flow\\sessions"
+      },
+      "name": "sessions_dir",
+      "ok": true
+    },
+    {
+      "detail": {
+        "path": "C:\\Program Files\\Git\\ucrt64\\bin\\git.exe",
+        "version": "git version 2.56.0.windows.4"
+      },
+      "name": "git",
+      "ok": true
+    },
+    {
+      "detail": {
+        "reason": "docker not found; sandbox jobs fall back to local-trusted"
+      },
+      "name": "docker",
+      "ok": false
+    },
+    {
+      "detail": {
+        "on_path": false,
+        "reason": "Linux-only runtime"
+      },
+      "name": "firecracker",
+      "ok": false
+    },
+    {
+      "detail": {
+        "exists": true,
+        "path": "C:\\Users\\omirb\\.atomic_flow\\graphs"
+      },
+      "name": "graphs_dir",
+      "ok": true
+    },
+    {
+      "detail": {
+        "newest_verify": {
+          "events": 1,
+          "incomplete_tail": false,
+          "verified": true
+        },
+        "sessions": [
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "task-task-2e6009b",
+            "state": {
+              "offset": 239,
+              "pending": 0,
+              "sequence": 1,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "22f64d88d486d0747ba5b91552a7306f",
+            "state": {
+              "offset": 2173,
+              "pending": 0,
+              "sequence": 3,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "4ef9254a19cfa791f495871304dc2cc2",
+            "state": {
+              "offset": 2174,
+              "pending": 0,
+              "sequence": 3,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "loop0c033f5b1c528741a4743259cc63b96b",
+            "state": {
+              "offset": 910,
+              "pending": 0,
+              "sequence": 3,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "child-fork-fde3d744c4156c1e05a82f88fe49d774",
+            "state": {
+              "offset": 623,
+              "pending": 0,
+              "sequence": 2,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "loopb111b9209eea2f6e65e38f45e4f60785",
+            "state": {
+              "offset": 2737,
+              "pending": 0,
+              "sequence": 9,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "child-fork-8edb0b1c6e77b29a452d424439b4460e",
+            "state": {
+              "offset": 624,
+              "pending": 0,
+              "sequence": 2,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          },
+          {
+            "checkpoint": {
+              "matches_state": true,
+              "offset": null,
+              "present": false,
+              "sequence": null
+            },
+            "ok": true,
+            "refresh_error": null,
+            "session_id": "child-fork-63b261edd0aee88ff6f0590c389112bc",
+            "state": {
+              "offset": 623,
+              "pending": 0,
+              "sequence": 2,
+              "tail_bytes_scanned": 0,
+              "tail_present": false,
+              "unresolved": []
+            }
+          }
+        ]
+      },
+      "name": "journal_health",
+      "ok": true
+    }
+  ],
+  "ok": false
+}

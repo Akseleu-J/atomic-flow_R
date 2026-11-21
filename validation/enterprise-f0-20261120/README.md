@@ -28,3 +28,20 @@
 Gate Ф0 открыт до зелёного `workflow_dispatch`, сборки из тега,
 записи решения владельца по ключам и отдельного приёмочного ревью.
 Ф1 пока не запускалась.
+
+## Дополнение 21.11: живой артефакт из зелёного workflow_dispatch
+
+Release-прогон `44932336545` на `643af42` собрал `engineer-beta-windows-2022`;
+zip распакован на хосте владельца, checksum совпал с SHA256SUMS. Живой прогон
+архивного `af.exe` (не локальной пересборки):
+
+- `af doctor --json` — все env-проверки PASS (docker/firecracker FAIL ожидаемо
+  на этом хосте), `journal_health` PASS: `live-artifact-doctor.json`.
+- Красная проверка К-1: пустой `ATOMIC_FLOW_HOME` → `beta pass: REFUSED -
+  beta pass required: install beta-pass.json`; `task run` отказан.
+- В-2′: пропуск в штатном состоянии → `ACTIVE, 22h 32m remaining (grant
+  engineer-beta-1, release beta-rc1)` — идентификатор участника прочитан из
+  подписанного тела, релиз сверен со вшитым.
+
+С-2 фиксации в этом прогоне не входили (локальный токен проверен ранее).
+Хвост Ф0: решение владельца по С-1/В-4 (утечка seed, ротация) + приёмочное ревью.
