@@ -239,14 +239,22 @@ def fixture(out_path: Path) -> None:
     print(f"frozen vector written: {out_path}")
 
 
-def generate_offline_pass(key_path: Path, out_path: str, grant_id: str, release_id: str) -> None:
-    """Generate a signed offline pass JSON file (no server needed). The
-    participant saves this to ~/.atomic_flow/beta-pass.json and the af
-    binary verifies it locally against its pinned issuer and release."""
+def generate_offline_pass(key_path: Path, out_path: str, grant_id: str, release_id: str,
+                          activate_days: int) -> None:
+    """Generate a signed schema-2 offline pass (no server needed). The
+    participant saves this to ~/.atomic_flow/beta-pass.json; the gate starts
+    the 96h window at the first gated operation and is cryptographically
+    bounded by hard_expires_at = activate_by + 96h."""
     now = int(time.time())
-    challenge = os.urandom(32).hex()
-    body = make_decision(grant_id, release_id, challenge, now,
-                         now + MAX_BETA_SECONDS, now)
+    body = json.dumps({
+        "schema_version": 2,
+        "grant_id": grant_id,
+        "release_id": release_id,
+        "issued_at": now,
+        "not_before": now,
+        "activate_by": now + activate_days * 24 * 60 * 60,
+        "hard_expires_at": now + (activate_days + 4) * 24 * 60 * 60,
+    }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     signature = sign(Path(key_path), body)
     pass_data = {
         "decision_b64": base64.b64encode(body).decode(),
@@ -258,7 +266,33 @@ def generate_offline_pass(key_path: Path, out_path: str, grant_id: str, release_
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(pass_data, indent=1))
-    print(f"offline pass written: {out} ({len(body)}B body, {len(signature)}B sig)")
+    print(f"offline pass written: {out} ({len(body)}B body, {len(signature)}B sig, "
+          f"activate within {activate_days}d, hard ceiling +{activate_days + 4}d)")
+
+
+def generate_crl(key_path: Path, out_path: str, sequence: int, revoke: list) -> None:
+    """Generate a signed revocation list (А-2): host the file on any static
+    URL (GitHub Pages / release asset); gates accept only strictly newer
+    sequences than their cache and fail open to the cache when offline."""
+    now = int(time.time())
+    body = json.dumps({
+        "schema_version": 1,
+        "sequence": sequence,
+        "issued_at": now,
+        "revoked": revoke,
+    }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    signature = sign(Path(key_path), body)
+    crl_data = {
+        "decision_b64": base64.b64encode(body).decode(),
+        "signature_hex": signature.hex(),
+        "sequence": sequence,
+        "revoked": revoke,
+    }
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(crl_data, indent=1))
+    print(f"CRL written: {out} (sequence {sequence}, revoked: {', '.join(revoke) or 'none'})")
 
 
 if __name__ == "__main__":
@@ -274,6 +308,11 @@ if __name__ == "__main__":
     parser.add_argument("--generate-pass", help="output path for the signed pass JSON")
     parser.add_argument("--grant", help="grant id for --generate-pass")
     parser.add_argument("--release", help="release id for --generate-pass")
+    parser.add_argument("--activate-days", type=int, default=7,
+                        help="pass activation window in days (schema 2)")
+    parser.add_argument("--generate-crl", help="output path for the signed CRL")
+    parser.add_argument("--sequence", type=int, default=1, help="CRL sequence number")
+    parser.add_argument("--revoke", default="", help="comma-separated grant ids to revoke")
     args = parser.parse_args()
     if args.generate_key:
         generate_key(Path(args.generate_key))
@@ -283,8 +322,12 @@ if __name__ == "__main__":
         fixture(Path(args.fixture))
     elif args.generate_pass:
         generate_offline_pass(
-            Path(args.key), args.generate_pass, args.grant, args.release
+            Path(args.key), args.generate_pass, args.grant, args.release,
+            max(1, int(args.activate_days)),
         )
+    elif args.generate_crl:
+        revoke = [item.strip() for item in args.revoke.split(",") if item.strip()]
+        generate_crl(Path(args.key), args.generate_crl, max(1, int(args.sequence)), revoke)
     elif args.serve:
         serve(args)
     else:

@@ -186,13 +186,13 @@ fn decision_provenance(body: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
-/// Verify the signed pass envelope file and return the trusted decision.
+/// Verify the signed pass envelope file and return the trusted window terms.
 fn verify_pass_file(
     pass_path: &Path,
     issuer_key: &[u8; 32],
     release: Option<&str>,
     now: u64,
-) -> Result<af_program::beta_access::AccessDecision, String> {
+) -> Result<af_program::beta_access::OfflinePass, String> {
     let file = std::fs::File::open(pass_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "beta pass required: install beta-pass.json".into()
@@ -216,11 +216,8 @@ fn verify_pass_file(
         .map_err(|_| "beta pass is not a valid envelope".to_string())?;
     let body = base64_decode(&pass.decision_b64)?;
     let signature = hex_64(&pass.signature_hex)?;
-    af_program::beta_access::authenticate_offline_pass(issuer_key, &body, &signature, release, now)
-        .map_err(|e| match e {
-            af_program::beta_access::AccessError::Inactive => "beta pass is inactive".to_string(),
-            _ => "beta pass is invalid (wrong release or tampered)".to_string(),
-        })
+    af_program::beta_access::authenticate_pass(issuer_key, &body, &signature, release, now)
+        .map_err(|_| "beta pass is invalid (wrong release or tampered)".to_string())
 }
 
 fn offline_required(
@@ -228,7 +225,7 @@ fn offline_required(
     pinned_issuer: Option<&str>,
     pinned_release: Option<&str>,
     now: u64,
-) -> Result<Option<af_program::beta_access::AccessDecision>, String> {
+) -> Result<Option<(af_program::beta_access::OfflinePass, [u8; 32])>, String> {
     let Some(issuer) = issuer_key(pinned_issuer)? else {
         return Ok(None);
     };
@@ -236,10 +233,11 @@ fn offline_required(
         let release = pinned_release
             .filter(|release| !release.is_empty())
             .ok_or("missing pinned beta release ID")?;
-        return verify_pass_file(pass_file, &issuer, Some(release), now).map(Some);
+        return verify_pass_file(pass_file, &issuer, Some(release), now)
+            .map(|pass| Some((pass, issuer)));
     }
     if pass_file.exists() {
-        return verify_pass_file(pass_file, &issuer, None, now).map(Some);
+        return verify_pass_file(pass_file, &issuer, None, now).map(|pass| Some((pass, issuer)));
     }
     Ok(None)
 }
@@ -298,12 +296,168 @@ fn development_service() -> Option<GateConfig> {
         .and_then(GateConfig::from_env)
 }
 
+const ACTIVATION_FILE: &str = "beta-activated-at";
+const CRL_CACHE_FILE: &str = "beta-crl-cache.json";
+const CRL_FETCH_SECONDS: u64 = 3;
+
+const PINNED_CRL_URL: Option<&str> = option_env!("AF_BETA_CRL_URL");
+
+fn crl_url() -> Option<String> {
+    if let Some(url) = PINNED_CRL_URL {
+        return Some(url.to_string());
+    }
+    #[cfg(feature = "dev-gate")]
+    match std::env::var("AF_BETA_CRL_URL") {
+        Ok(url) => return Some(url),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => return None,
+    }
+    None
+}
+
+fn load_crl_cache(home: &Path) -> Option<(u64, Vec<String>)> {
+    let raw = std::fs::read(home.join(CRL_CACHE_FILE)).ok()?;
+    let value: Value = serde_json::from_slice(&raw).ok()?;
+    let sequence = value.get("sequence")?.as_u64()?;
+    let revoked = value
+        .get("revoked")?
+        .as_array()?
+        .iter()
+        .filter_map(|grant| grant.as_str().map(str::to_string))
+        .collect();
+    Some((sequence, revoked))
+}
+
+fn save_crl_cache(home: &Path, crl: &af_program::beta_access::CrlBody) -> Result<(), String> {
+    let record = json!({"sequence": crl.sequence(), "revoked": crl.revoked()});
+    let temporary = home.join(format!("beta-crl-{}.tmp", af_entropy::token()));
+    let save = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(
+            serde_json::to_vec(&record)
+                .map_err(std::io::Error::other)?
+                .as_slice(),
+        )?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, home.join(CRL_CACHE_FILE))
+    })();
+    if let Err(error) = save {
+        let _ = std::fs::remove_file(temporary);
+        return Err(format!("beta CRL cache write failed: {error}"));
+    }
+    Ok(())
+}
+
+/// Revocation check (А-2): accept only strictly newer signed lists than the
+/// cached one; unavailable network, an unparsable list or a stale sequence
+/// fails OPEN to the cache — the same-privilege anchor never bricks the gate.
+fn crl_check(home: &Path, issuer_key: &[u8; 32], grant_id: &str, now: u64) -> Result<(), String> {
+    let cached = load_crl_cache(home);
+    let best_sequence = cached.as_ref().map(|(sequence, _)| *sequence).unwrap_or(0);
+    let mut best_revoked = cached.map(|(_, revoked)| revoked).unwrap_or_default();
+    if let Some(url) = crl_url() {
+        let fetched = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(CRL_FETCH_SECONDS))
+            .call();
+        if let Ok(response) = fetched {
+            let mut raw = Vec::new();
+            if response
+                .into_reader()
+                .take(MAX_RESPONSE_BYTES as u64 + 1)
+                .read_to_end(&mut raw)
+                .is_ok()
+                && raw.len() <= MAX_RESPONSE_BYTES
+            {
+                if let Ok(envelope) = serde_json::from_slice::<DecisionEnvelope>(&raw) {
+                    if let (Ok(body), Ok(signature)) = (
+                        base64_decode(&envelope.decision_b64),
+                        hex_64(&envelope.signature_hex),
+                    ) {
+                        if let Ok(crl) = af_program::beta_access::authenticate_crl(
+                            issuer_key, &body, &signature, now,
+                        ) {
+                            if crl.sequence() > best_sequence {
+                                let _ = save_crl_cache(home, &crl);
+                                best_revoked = crl.revoked().to_vec();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if best_revoked.iter().any(|revoked| revoked == grant_id) {
+        return Err(format!(
+            "beta pass revoked (grant {grant_id}); export your evidence with `af evidence export` and report back"
+        ));
+    }
+    Ok(())
+}
+
+/// The activation marker starts the signed window at the participant's first
+/// gated operation. It is written exactly once while the signed
+/// activate_by deadline is open; deleting it later cannot extend exposure
+/// beyond the signed hard_expires_at ceiling.
+fn activation_time(
+    home: &Path,
+    pass: &af_program::beta_access::OfflinePass,
+    now: u64,
+) -> Result<u64, String> {
+    let _lease = Some(af_entropy::FileLease::acquire(
+        &home.join("beta-activation.lock"),
+        true,
+        "beta activation is busy",
+    )?);
+    let marker = home.join(ACTIVATION_FILE);
+    let previous = match std::fs::File::open(&marker) {
+        Ok(file) => {
+            let mut value = String::new();
+            file.take(21)
+                .read_to_string(&mut value)
+                .map_err(|e| format!("beta activation marker read failed: {e}"))?;
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| "invalid beta activation marker")?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(format!("beta activation marker read failed: {error}")),
+    };
+    if previous > 0 {
+        return Ok(previous);
+    }
+    if now > pass.activate_by() {
+        return Err("beta pass activation window closed; the pass was never activated".into());
+    }
+    let temporary = home.join(format!("beta-activate-{}.tmp", af_entropy::token()));
+    let save = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        write!(file, "{now}")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &marker)
+    })();
+    if let Err(error) = save {
+        let _ = std::fs::remove_file(temporary);
+        return Err(format!("beta activation marker write failed: {error}"));
+    }
+    Ok(now)
+}
+
 /// Report the same offline admission decision used by product operations.
+/// A status check never activates a pass and never persists the clock marker.
 pub fn status_report(now: u64) -> String {
     let home = af_sandbox::user_dir();
     let pass_file = home.join(OFFLINE_PASS_FILE);
     match offline_required(&pass_file, PINNED_ISSUER, PINNED_RELEASE, now) {
-        Ok(Some(decision)) => {
+        Ok(Some((pass, issuer))) => {
             let now = if PINNED_ISSUER.is_some() {
                 match effective_time(&home, now, false) {
                     Ok(now) => now,
@@ -312,16 +466,46 @@ pub fn status_report(now: u64) -> String {
             } else {
                 now
             };
-            if decision.expires_at() <= now {
+            if let Err(message) = crl_check(&home, &issuer, pass.grant_id(), now) {
+                return format!("beta pass: REFUSED - {message}");
+            }
+            if now < pass.not_before() {
+                return "beta pass: REFUSED - the pass is not valid yet".into();
+            }
+            let marker = std::fs::File::open(home.join(ACTIVATION_FILE))
+                .ok()
+                .and_then(|file| {
+                    let mut text = String::new();
+                    file.take(21).read_to_string(&mut text).ok()?;
+                    Some(text)
+                })
+                .and_then(|text| text.trim().parse::<u64>().ok());
+            let Some(activated) = marker else {
+                if now > pass.activate_by() {
+                    return "beta pass: REFUSED - the activation window closed; the pass was never activated".into();
+                }
+                let left = pass.activate_by() - now;
+                return format!(
+                    "beta pass: READY, {}h {}m left to activate (grant {}, release {}); the 96h window starts at first product operation",
+                    left / 3600,
+                    (left % 3600) / 60,
+                    pass.grant_id(),
+                    pass.release_id()
+                );
+            };
+            let expires = activated
+                .saturating_add(af_program::beta_access::MAX_BETA_SECONDS)
+                .min(pass.hard_expires_at());
+            if now >= expires {
                 return "beta pass: REFUSED - the pass window has closed".into();
             }
-            let remaining = decision.expires_at() - now;
+            let remaining = expires - now;
             return format!(
                 "beta pass: ACTIVE, {}h {}m remaining (grant {}, release {})",
                 remaining / 3600,
                 (remaining % 3600) / 60,
-                decision.grant_id(),
-                decision.release_id()
+                pass.grant_id(),
+                pass.release_id()
             );
         }
         Err(message) => return format!("beta pass: REFUSED - {message}"),
@@ -353,28 +537,9 @@ pub fn require_current_access() -> Result<(), String> {
 fn gate_new_operation(now: u64) -> Result<(), String> {
     let home = af_sandbox::user_dir();
     let pass_file = home.join(OFFLINE_PASS_FILE);
-    if let Some(decision) = offline_required(&pass_file, PINNED_ISSUER, PINNED_RELEASE, now)? {
-        let now = if PINNED_ISSUER.is_some() {
-            effective_time(&home, now, true)?
-        } else {
-            now
-        };
-        if decision.expires_at() <= now {
-            let message = "beta access expired - the pass window has closed";
-            if PINNED_ISSUER.is_some() {
-                let _retirement = af_entropy::FileLease::acquire(
-                    &home.join("beta-retirement.lock"),
-                    true,
-                    "beta retirement is busy",
-                )?;
-                self_destruct(decision.grant_id(), now)?;
-                return Err(format!(
-                    "{message}. See beta-final-report in the Atomic Flow state directory."
-                ));
-            }
-            return Err(message.into());
-        }
-        return Ok(());
+    if let Some((pass, issuer)) = offline_required(&pass_file, PINNED_ISSUER, PINNED_RELEASE, now)?
+    {
+        return enforce_offline_window(&home, &pass, issuer, PINNED_ISSUER.is_some(), now);
     }
     match development_service() {
         None => Ok(()),
@@ -389,6 +554,45 @@ fn gate_new_operation(now: u64) -> Result<(), String> {
             }
         },
     }
+}
+
+/// The pinned offline admission: rollback-guarded clock, revocation check,
+/// one-time activation, and the effective expiry
+/// min(activation + MAX_BETA_SECONDS, hard_expires_at). `pinned` selects the
+/// retirement behavior on expiry and whether the clock marker persists.
+fn enforce_offline_window(
+    home: &Path,
+    pass: &af_program::beta_access::OfflinePass,
+    issuer: [u8; 32],
+    pinned: bool,
+    now: u64,
+) -> Result<(), String> {
+    let now = if pinned {
+        effective_time(home, now, true)?
+    } else {
+        now
+    };
+    crl_check(home, &issuer, pass.grant_id(), now)?;
+    let activated = activation_time(home, pass, now)?;
+    let expires = activated
+        .saturating_add(af_program::beta_access::MAX_BETA_SECONDS)
+        .min(pass.hard_expires_at());
+    if now >= expires {
+        let message = "beta access expired - the pass window has closed";
+        if pinned {
+            let _retirement = af_entropy::FileLease::acquire(
+                &home.join("beta-retirement.lock"),
+                true,
+                "beta retirement is busy",
+            )?;
+            self_destruct(pass.grant_id(), now)?;
+            return Err(format!(
+                "{message}. See beta-final-report in the Atomic Flow state directory."
+            ));
+        }
+        return Err(message.into());
+    }
+    Ok(())
 }
 
 fn self_destruct(grant_id: &str, now: u64) -> Result<Value, String> {
@@ -495,6 +699,12 @@ pub fn open_feedback_email(grant_id: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn temp_home() -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("af-beta-gate-{}", af_entropy::token()));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
     #[test]
     fn pinned_build_requires_a_pass_and_release() {
         let pass = std::env::temp_dir()
@@ -556,5 +766,164 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Independent copy of the frozen signing domain: if af-program ever
+    /// changes it, this test breaks loudly instead of silently trusting.
+    const TEST_DOMAIN: &[u8] = b"atomic-flow/beta-access/v1\0";
+
+    fn mint_pass(home: &std::path::Path, grant: &str, not_before: u64, activate_by: u64) -> String {
+        use ring::signature::KeyPair;
+        let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "schema_version": 2, "grant_id": grant, "release_id": "beta-rc1",
+            "issued_at": not_before, "not_before": not_before,
+            "activate_by": activate_by,
+            "hard_expires_at": activate_by + af_program::beta_access::MAX_BETA_SECONDS,
+        }))
+        .unwrap();
+        let signature = pair.sign(&[TEST_DOMAIN, &body].concat());
+        let envelope = json!({
+            "decision_b64": base64_encode(&body),
+            "signature_hex": signature.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "grant_id": grant,
+            "release_id": "beta-rc1",
+        });
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(
+            home.join(OFFLINE_PASS_FILE),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+        pair.public_key()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let group = chunk.iter().map(|b| *b as u32).collect::<Vec<_>>();
+            let packed = (group[0] << 16)
+                | (group.get(1).copied().unwrap_or(0) << 8)
+                | group.get(2).copied().unwrap_or(0);
+            out.push(ALPHABET[(packed >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(packed >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(packed >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[packed as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn pass_v2_activates_on_first_operation_and_respects_the_ceiling() {
+        let home = temp_home();
+        let t0 = 1_000_000u64;
+        let pinned = mint_pass(&home, "engineer-x", t0, t0 + 3600);
+        let pass_file = home.join(OFFLINE_PASS_FILE);
+        // First gated operation starts the window.
+        let (pass, issuer) = offline_required(&pass_file, Some(&pinned), Some("beta-rc1"), t0)
+            .unwrap()
+            .unwrap();
+        enforce_offline_window(&home, &pass, issuer, true, t0).unwrap();
+        let marker: u64 = std::fs::read_to_string(home.join(ACTIVATION_FILE))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(marker, t0, "the window starts at the first operation");
+        // Later operations reuse the recorded activation.
+        let (pass, issuer) = offline_required(&pass_file, Some(&pinned), Some("beta-rc1"), t0 + 60)
+            .unwrap()
+            .unwrap();
+        enforce_offline_window(&home, &pass, issuer, true, t0 + 60).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(ACTIVATION_FILE))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap(),
+            t0,
+            "activation is written exactly once"
+        );
+        // The ceiling is activate_by + 96h, regardless of the marker.
+        let ceiling = t0 + 3600 + af_program::beta_access::MAX_BETA_SECONDS;
+        let (pass, issuer) =
+            offline_required(&pass_file, Some(&pinned), Some("beta-rc1"), ceiling + 1)
+                .unwrap()
+                .unwrap();
+        let error = enforce_offline_window(&home, &pass, issuer, false, ceiling + 1).unwrap_err();
+        assert!(
+            error.contains("window has closed"),
+            "past the signed ceiling the gate refuses: {error}"
+        );
+    }
+
+    #[test]
+    fn late_activation_is_refused_once_the_signed_window_closes() {
+        let home = temp_home();
+        let t0 = 2_000_000u64;
+        let pinned = mint_pass(&home, "engineer-late", t0, t0 + 3600);
+        let pass_file = home.join(OFFLINE_PASS_FILE);
+        let (pass, issuer) =
+            offline_required(&pass_file, Some(&pinned), Some("beta-rc1"), t0 + 3600 + 1)
+                .unwrap()
+                .unwrap();
+        let error = enforce_offline_window(&home, &pass, issuer, true, t0 + 3600 + 1).unwrap_err();
+        assert!(
+            error.contains("activation window closed"),
+            "never-activated passes past activate_by are refused: {error}"
+        );
+        assert!(!home.join(ACTIVATION_FILE).exists());
+    }
+
+    #[test]
+    fn crl_cache_accepts_only_newer_sequences_and_revokes_grants() {
+        let home = temp_home();
+        let t0 = 3_000_000u64;
+        let pinned = mint_pass(&home, "engineer-good", t0, t0 + 3600);
+        let pass_file = home.join(OFFLINE_PASS_FILE);
+        let admit = |now: u64| {
+            let (pass, issuer) = offline_required(&pass_file, Some(&pinned), Some("beta-rc1"), now)
+                .unwrap()
+                .unwrap();
+            enforce_offline_window(&home, &pass, issuer, false, now)
+        };
+        // No cache, no fetch URL: the gate passes.
+        admit(t0).unwrap();
+        // A cache revoking this grant blocks continuation (no fetch is
+        // configured, so the cache is the best knowledge).
+        std::fs::write(
+            home.join(CRL_CACHE_FILE),
+            json!({"sequence": 3, "revoked": ["engineer-good"]}).to_string(),
+        )
+        .unwrap();
+        let error = admit(t0 + 60).unwrap_err();
+        assert!(
+            error.contains("beta pass revoked"),
+            "the cached revocation list blocks the grant: {error}"
+        );
+        // A newer list without the revocation unblocks: strictly newer
+        // sequences replace the cached set.
+        std::fs::write(
+            home.join(CRL_CACHE_FILE),
+            json!({"sequence": 4, "revoked": ["engineer-other"]}).to_string(),
+        )
+        .unwrap();
+        admit(t0 + 120).unwrap();
+        // A corrupt cache is ignored (fail-open to no knowledge).
+        std::fs::write(home.join(CRL_CACHE_FILE), "corrupt").unwrap();
+        admit(t0 + 180).unwrap();
     }
 }
